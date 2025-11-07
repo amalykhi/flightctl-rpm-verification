@@ -1,0 +1,18 @@
+# Temporary files
+*.log
+*.rpm
+index.html
+
+# Verification directories
+flightctl_verification_*/
+
+# Temporary reports (keep only the final one)
+OIDC_VERIFICATION_REPORT.md
+QUICK_START.md
+older_build_test.log
+latest_build_rerun.log
+latest_test.log
+
+# Editor files
+*~
+.*.swp
