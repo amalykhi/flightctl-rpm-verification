@@ -534,10 +534,10 @@ start_services() {
     
     ssh_exec_sudo "systemctl start flightctl.target"
     
-    log_info "Waiting for services to start and stabilize..."
+    log_info "Waiting for services to start and stabilize (up to 10 minutes)..."
     
     # Wait and check service status multiple times
-    local max_attempts=6
+    local max_attempts=60  # 60 attempts * 10 seconds = 10 minutes
     local wait_time=10
     local attempt=1
     
@@ -547,24 +547,27 @@ start_services() {
         local running=$(ssh_exec "systemctl list-units 'flightctl*' --no-legend | grep running | wc -l" || echo "0")
         local activating=$(ssh_exec "systemctl list-units 'flightctl*' --no-legend | grep -E 'activating|auto-restart' | wc -l" || echo "0")
         
-        log_info "Attempt $attempt/$max_attempts: $running services running, $activating services starting..."
+        # Show progress every 3 attempts (30 seconds) to reduce log spam
+        if [ $((attempt % 3)) -eq 0 ] || [ $attempt -le 3 ]; then
+            log_info "Attempt $attempt/$max_attempts: $running services running, $activating services starting... ($((attempt * wait_time))s elapsed)"
+        fi
         
         # If we have services running and nothing activating, we're good
         if [ "$running" -ge 8 ] && [ "$activating" -eq 0 ]; then
-            log_success "Services are stable with $running services running"
+            log_success "Services are stable with $running services running (after $((attempt * wait_time))s)"
             return 0
         fi
         
-        # If no progress after several attempts, continue anyway
-        if [ $attempt -ge 4 ] && [ "$running" -ge 5 ]; then
-            log_warning "Some services still starting, but proceeding with $running services"
+        # If no progress after 4 minutes, continue anyway
+        if [ $attempt -ge 24 ] && [ "$running" -ge 5 ]; then
+            log_warning "Some services still starting, but proceeding with $running services (after $((attempt * wait_time))s)"
             return 0
         fi
         
         attempt=$((attempt + 1))
     done
     
-    log_warning "Services may still be starting after $((max_attempts * wait_time))s"
+    log_warning "Services may still be starting after $((max_attempts * wait_time))s (10 minutes)"
 }
 
 check_service_status() {
