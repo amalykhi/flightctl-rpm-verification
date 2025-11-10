@@ -183,21 +183,149 @@ determine_rpm_url() {
     log_info "RPM Base URL: ${RPM_BASE_URL}"
 }
 
-get_vm_ip() {
-    log_info "Getting VM IP address for ${VM_NAME}..."
+check_vm_exists() {
+    sudo virsh list --all | grep -q "${VM_NAME}"
+}
+
+create_vm() {
+    log_info "VM '${VM_NAME}' not found. Creating new VM..."
     
-    # Check if VM exists and is running
-    if ! sudo virsh list --all | grep -q "${VM_NAME}"; then
-        log_error "VM '${VM_NAME}' not found"
+    # Check prerequisites for VM creation
+    if ! command -v virt-install &> /dev/null; then
+        log_error "virt-install not found. Install with: sudo dnf install -y virt-install"
         exit 1
     fi
     
-    # Check if VM is running
-    if ! sudo virsh list | grep -q "${VM_NAME}.*running"; then
-        log_warning "VM '${VM_NAME}' is not running. Starting it..."
-        sudo virsh start "${VM_NAME}"
-        sleep 10
+    # Build virt-install command
+    local virt_install_cmd="sudo virt-install \
+        --name ${VM_NAME} \
+        --memory ${VM_MEMORY} \
+        --vcpus ${VM_CPUS} \
+        --disk size=${VM_DISK_SIZE} \
+        --os-variant ${VM_OS_VARIANT} \
+        --network network=${VM_NETWORK} \
+        --graphics none \
+        --console pty,target_type=serial"
+    
+    # Add installation source
+    if [ -n "${VM_INSTALL_SOURCE}" ]; then
+        if [[ "${VM_INSTALL_SOURCE}" == http* ]]; then
+            virt_install_cmd+=" --location ${VM_INSTALL_SOURCE}"
+        elif [[ "${VM_INSTALL_SOURCE}" == *.iso ]]; then
+            virt_install_cmd+=" --cdrom ${VM_INSTALL_SOURCE}"
+        elif [ "${VM_INSTALL_SOURCE}" = "pxe" ]; then
+            virt_install_cmd+=" --pxe"
+        else
+            log_error "Invalid VM_INSTALL_SOURCE: ${VM_INSTALL_SOURCE}"
+            exit 1
+        fi
+    else
+        log_error "VM_INSTALL_SOURCE not specified in config"
+        exit 1
     fi
+    
+    # Add kickstart if provided
+    if [ -n "${VM_KICKSTART_FILE}" ]; then
+        virt_install_cmd+=" --extra-args \"inst.ks=${VM_KICKSTART_FILE}\""
+    fi
+    
+    # Add cloud-init if provided
+    if [ -n "${VM_CLOUD_INIT_USER_DATA}" ] && [ -n "${VM_CLOUD_INIT_META_DATA}" ]; then
+        virt_install_cmd+=" --cloud-init user-data=${VM_CLOUD_INIT_USER_DATA},meta-data=${VM_CLOUD_INIT_META_DATA}"
+    fi
+    
+    # Add noautoconsole for automated installation
+    virt_install_cmd+=" --noautoconsole"
+    
+    log_info "Creating VM with command:"
+    log_info "${virt_install_cmd}"
+    
+    # Execute virt-install
+    if eval "${virt_install_cmd}"; then
+        log_success "VM creation started successfully"
+        
+        # Wait for VM to be created
+        log_info "Waiting for VM installation to complete..."
+        log_info "This may take 10-30 minutes depending on your system and network speed"
+        
+        # Check if VM appears in the list
+        local max_wait=60
+        local count=0
+        while [ $count -lt $max_wait ]; do
+            if sudo virsh list --all | grep -q "${VM_NAME}"; then
+                log_success "VM '${VM_NAME}' is now visible in virsh"
+                break
+            fi
+            sleep 5
+            count=$((count + 1))
+            if [ $((count % 6)) -eq 0 ]; then
+                log_info "Still waiting for VM... ($((count * 5))s elapsed)"
+            fi
+        done
+        
+        if [ $count -ge $max_wait ]; then
+            log_warning "VM creation is taking longer than expected"
+            log_info "You may need to monitor the installation manually with: sudo virsh console ${VM_NAME}"
+        fi
+        
+        # Wait for VM to complete installation and be running
+        log_info "Waiting for VM to be in running state..."
+        max_wait=120  # 10 minutes
+        count=0
+        while [ $count -lt $max_wait ]; do
+            if sudo virsh list --state-running | grep -q "${VM_NAME}"; then
+                log_success "VM '${VM_NAME}' is now running"
+                sleep 30  # Give it extra time for SSH to be ready
+                return 0
+            fi
+            sleep 5
+            count=$((count + 1))
+            if [ $((count % 12)) -eq 0 ]; then
+                log_info "Still waiting for VM to be running... ($((count * 5))s elapsed)"
+            fi
+        done
+        
+        log_error "VM did not reach running state within expected time"
+        log_info "Check VM status with: sudo virsh list --all"
+        log_info "Check VM console with: sudo virsh console ${VM_NAME}"
+        exit 1
+    else
+        log_error "Failed to create VM"
+        exit 1
+    fi
+}
+
+ensure_vm_exists() {
+    if ! check_vm_exists; then
+        if [ "${CREATE_VM_IF_MISSING}" = "true" ]; then
+            create_vm
+        else
+            log_error "VM '${VM_NAME}' not found"
+            log_info "To auto-create VM, set CREATE_VM_IF_MISSING=true in verification.conf"
+            exit 1
+        fi
+    else
+        log_info "VM '${VM_NAME}' exists"
+        
+        # Check if VM is running, start if not
+        if ! sudo virsh list --state-running | grep -q "${VM_NAME}"; then
+            log_info "VM is not running. Starting..."
+            if sudo virsh start "${VM_NAME}"; then
+                log_success "VM started successfully"
+                sleep 10  # Wait for boot
+            else
+                log_error "Failed to start VM"
+                exit 1
+            fi
+        fi
+    fi
+}
+
+get_vm_ip() {
+    log_info "Getting VM IP address for ${VM_NAME}..."
+    
+    # Ensure VM exists and is running
+    ensure_vm_exists
     
     # Get IP address
     VM_IP=$(sudo virsh domifaddr "${VM_NAME}" | grep -oP '(\d+\.){3}\d+' | head -1)
