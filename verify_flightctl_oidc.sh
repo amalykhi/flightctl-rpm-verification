@@ -324,25 +324,20 @@ configure_oidc() {
     log_info "Updating /etc/flightctl/service-config.yaml..."
     ssh_exec_sudo "sed -i \
         -e 's/type: none/type: oidc/' \
-        -e 's|baseDomain:|baseDomain: ${VM_IP}|' \
+        -e 's|baseDomain:.*|baseDomain: ${VM_IP}|' \
         -e 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' \
         -e 's|externalOidcAuthority:.*|externalOidcAuthority: \"${oidc_authority}\"|' \
         -e 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' \
-        -e 's|insecureSkipTlsVerify: false|insecureSkipTlsVerify: true|' \
         /etc/flightctl/service-config.yaml"
     
     # Update API config
     log_info "Updating /etc/flightctl/flightctl-api/config.yaml..."
-    ssh_exec "cat > /tmp/oidc_config.txt << 'EOF'
-  type: oidc
-  oidc:
-    oidcAuthority: ${oidc_authority}
-    externalOidcAuthority: ${oidc_authority}
-    oidcClientId: ${OIDC_CLIENT_ID}
-EOF"
-    
-    ssh_exec_sudo "sed -i '/^auth:/a\\  type: oidc' /etc/flightctl/flightctl-api/config.yaml"
-    ssh_exec_sudo "bash -c 'cat /tmp/oidc_config.txt >> /etc/flightctl/flightctl-api/config.yaml'"
+    ssh_exec_sudo "sed -i \
+        -e 's/type: none/type: oidc/' \
+        -e 's|oidcAuthority:.*|oidcAuthority: ${oidc_authority}|' \
+        -e 's|externalOidcAuthority:.*|externalOidcAuthority: ${oidc_authority}|' \
+        -e 's|oidcClientId:.*|oidcClientId: ${OIDC_CLIENT_ID}|' \
+        /etc/flightctl/flightctl-api/config.yaml"
     
     log_success "OIDC configuration updated"
 }
