@@ -494,13 +494,15 @@ configure_oidc() {
     
     # Update main service config
     log_info "Updating /etc/flightctl/service-config.yaml..."
-    ssh_exec_sudo "sed -i \
-        -e 's/type: none/type: oidc/' \
-        -e 's|baseDomain:.*|baseDomain: ${VM_IP}|' \
-        -e 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' \
-        -e 's|externalOidcAuthority:.*|externalOidcAuthority: \"${oidc_authority}\"|' \
-        -e 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' \
-        /etc/flightctl/service-config.yaml"
+    
+    # Run sed commands separately to avoid quoting/escaping issues
+    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml"
+    ssh_exec_sudo "sed -i 's|baseDomain:.*|baseDomain: ${VM_IP}|' /etc/flightctl/service-config.yaml"
+    ssh_exec_sudo "sed -i 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml"
+    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml"
+    ssh_exec_sudo "sed -i 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' /etc/flightctl/service-config.yaml"
+    
+    log_success "Service config updated"
     
     # Regenerate API config from service config
     log_info "Regenerating API config from template..."
