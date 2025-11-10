@@ -330,14 +330,15 @@ configure_oidc() {
         -e 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' \
         /etc/flightctl/service-config.yaml"
     
-    # Update API config
-    log_info "Updating /etc/flightctl/flightctl-api/config.yaml..."
-    ssh_exec_sudo "sed -i \
-        -e 's/type: none/type: oidc/' \
-        -e 's|oidcAuthority:.*|oidcAuthority: ${oidc_authority}|' \
-        -e 's|externalOidcAuthority:.*|externalOidcAuthority: ${oidc_authority}|' \
-        -e 's|oidcClientId:.*|oidcClientId: ${OIDC_CLIENT_ID}|' \
-        /etc/flightctl/flightctl-api/config.yaml"
+    # Regenerate API config from service config
+    log_info "Regenerating API config from template..."
+    ssh_exec_sudo "rm -f /etc/flightctl/flightctl-api/config.yaml"
+    ssh_exec_sudo "systemctl unmask flightctl-api-init.service"
+    ssh_exec_sudo "systemctl start flightctl-api-init.service"
+    
+    # Wait for API init to complete
+    sleep 3
+    ssh_exec_sudo "systemctl mask flightctl-api-init.service"
     
     log_success "OIDC configuration updated"
 }
