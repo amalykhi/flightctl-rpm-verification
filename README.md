@@ -8,11 +8,65 @@ The script requires the following tools to be installed on your host machine:
 
 ```bash
 sudo dnf install -y virsh sshpass curl wget jq
+
+# Optional: For VM auto-creation
+sudo dnf install -y virt-install libvirt qemu-kvm
 ```
+
+## Configuration
+
+**All settings are now centralized in `verification.conf`!**
+
+Edit this file to customize your environment:
+
+```bash
+vim verification.conf
+```
+
+### Key Configuration Options
+
+```bash
+# VM Configuration
+VM_NAME="eurolinux9"              # VM name
+VM_USER="amalykhi"                # SSH user
+VM_PASSWORD=" "                   # SSH password
+
+# VM Auto-Creation (NEW!)
+CREATE_VM_IF_MISSING="false"     # Set to "true" to auto-create VM
+VM_MEMORY="4096"                  # RAM in MB
+VM_CPUS="2"                       # Number of CPUs
+VM_DISK_SIZE="20"                 # Disk size in GB
+VM_INSTALL_SOURCE="https://..."  # Installation URL or ISO
+
+# RPM Source
+RPM_SOURCE="LATEST"               # Or specific URL
+
+# OIDC Configuration
+OIDC_REALM="myrealm"
+OIDC_CLIENT_ID="my_client"
+
+# Test User
+TEST_USER="testuser"
+TEST_PASSWORD="password"
+```
+
+**See `verification.conf` for all available options.**
 
 ## Usage
 
-### Basic Usage
+### Method 1: Using Configuration File (Recommended)
+
+**Step 1**: Edit `verification.conf` with your settings
+
+**Step 2**: Run the script:
+
+```bash
+./verify_flightctl_oidc.sh
+```
+
+That's it! The script reads all settings from `verification.conf`.
+
+### Method 2: Using Command-Line Arguments (Legacy)
 
 ```bash
 ./verify_flightctl_oidc.sh <VM_NAME> <RPM_URL|LATEST>
@@ -24,72 +78,120 @@ sudo dnf install -y virsh sshpass curl wget jq
   - Full URL to the RPM repository, OR
   - `LATEST` to automatically use the most recent successful build
 
-### Examples
+## Examples
 
-#### 🌟 Using LATEST (Recommended) - Automatically fetches the newest build:
+### 🌟 Example 1: Use Default Config
+
+```bash
+# Edit config first
+vim verification.conf
+
+# Run with config
+./verify_flightctl_oidc.sh
+```
+
+### 🚀 Example 2: Auto-Create VM (NEW!)
+
+In `verification.conf`:
+
+```bash
+# Enable VM auto-creation
+CREATE_VM_IF_MISSING="true"
+
+# VM will be created if it doesn't exist!
+VM_NAME="my-new-vm"
+VM_MEMORY="4096"
+VM_CPUS="2"
+VM_DISK_SIZE="20"
+VM_INSTALL_SOURCE="https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/"
+VM_KICKSTART_FILE="https://myserver.com/kickstart.cfg"  # Optional
+```
+
+Run the script - VM will be created automatically:
+
+```bash
+./verify_flightctl_oidc.sh
+```
+
+**See `VM_CREATION_GUIDE.md` for complete VM creation documentation.**
+
+### Example 3: Use Custom Config File
+
+```bash
+# Create custom config
+cp verification.conf my_test.conf
+vim my_test.conf
+
+# Run with custom config
+./verify_flightctl_oidc.sh my_test.conf
+```
+
+### Example 4: Legacy Mode with LATEST
 
 ```bash
 ./verify_flightctl_oidc.sh eurolinux9 LATEST
 ```
 
-This will:
-1. Query the [Copr builds page](https://copr.fedorainfracloud.org/coprs/g/redhat-et/flightctl-dev/builds/)
-2. Find the most recent successful build
-3. Automatically construct the RPM download URL
-4. Proceed with installation
-
-#### Using a specific RPM build:
-
-```bash
-./verify_flightctl_oidc.sh eurolinux9 https://download.copr.fedorainfracloud.org/results/@redhat-et/flightctl-dev/epel-9-x86_64/09772870-flightctl/
-```
-
-#### Using custom VM with LATEST:
-
-```bash
-./verify_flightctl_oidc.sh my-fedora-vm LATEST
-```
-
-#### Using a different specific build:
-
-```bash
-./verify_flightctl_oidc.sh eurolinux9 https://download.copr.fedorainfracloud.org/results/@redhat-et/flightctl-dev/epel-9-x86_64/09773000-flightctl/
-```
-
 ## What the Script Does
 
-1. **Prerequisites Check**: Verifies all required tools are available
-2. **RPM Source Detection**:
-   - If `LATEST` is specified: Automatically queries Copr builds page and finds the newest successful build
-   - If URL is specified: Uses the provided URL directly
-3. **VM Setup**: 
-   - Checks if VM exists and is running
+### Complete Workflow
+
+1. **Configuration Loading**:
+   - Loads settings from `verification.conf`
+   - Supports command-line overrides for backward compatibility
+
+2. **Prerequisites Check**: 
+   - Verifies all required tools are available
+   - Checks for virt-install if VM creation is enabled
+
+3. **VM Management** (NEW!):
+   - Checks if VM exists
+   - **Auto-creates VM** if missing (when `CREATE_VM_IF_MISSING=true`)
+   - Starts VM if it's stopped
+   - Waits for VM to be ready
    - Gets VM IP address
    - Tests connectivity
-4. **RPM Download**: 
+
+4. **RPM Source Detection**:
+   - If `LATEST` or `RPM_SOURCE="LATEST"`: Automatically queries Copr builds page and finds the newest successful build
+   - If URL is specified: Uses the provided URL directly
+
+5. **RPM Download**: 
    - Downloads flightctl-services and flightctl-cli RPMs from the determined source
    - Saves to timestamped work directory
-5. **VM Preparation**:
+
+6. **VM Preparation**:
    - Copies RPMs to VM
    - Stops existing FlightCtl services
    - Removes old packages
-6. **Installation**:
+
+7. **Installation**:
    - Installs new RPM packages
-   - Retags container images if needed (0.10.0 → 1.0.0-main-222)
-7. **OIDC Configuration**:
+   - Verifies container images are available
+
+8. **OIDC Configuration**:
    - Updates `/etc/flightctl/service-config.yaml`
-   - Updates `/etc/flightctl/flightctl-api/config.yaml`
+   - Regenerates `/etc/flightctl/flightctl-api/config.yaml` from template
    - Configures OIDC with Keycloak settings
-8. **Service Management**:
+
+9. **Service Management**:
    - Starts all FlightCtl services
    - Waits for services to stabilize
    - Checks service status
-9. **Verification**:
+
+10. **OIDC Authentication Testing** (NEW!):
+   - Tests Keycloak token endpoint with test user
+   - Tests FlightCtl CLI login
+   - Tests authenticated device/fleet queries
+   - Verifies end-to-end auth flow
+
+11. **Verification**:
    - Tests CLI access (flightctl get devices/fleets)
    - Tests UI accessibility (HTTP 200 check)
    - Tests API functionality
    - Checks OIDC authentication status
-10. **Reporting**:
+
+12. **Reporting**:
    - Collects logs from failed services
    - Generates comprehensive verification report
 
@@ -173,10 +275,59 @@ https://<VM_IP>:443
 curl -k https://<VM_IP>:3443/api/v1/devices
 ```
 
+## 🌟 Key Features
+
+### ✅ Centralized Configuration
+- **All settings in `verification.conf`**
+- No need to edit scripts
+- Easy to maintain multiple environments
+- Version control friendly
+
+### ✅ Automated VM Creation (NEW!)
+- Auto-create VMs if missing
+- Multiple installation methods (URL, ISO, PXE)
+- Kickstart and Cloud-init support
+- Perfect for CI/CD pipelines
+
+### ✅ OIDC Authentication Testing (NEW!)
+- End-to-end authentication verification
+- Keycloak token endpoint testing
+- CLI login testing
+- Authenticated API query testing
+
+### ✅ Smart VM Management
+- Auto-starts stopped VMs
+- Waits for VM readiness
+- Handles IP address detection
+- Tests connectivity
+
+### ✅ Automatic LATEST Build Detection
+- Queries Copr for newest build
+- No manual URL lookup needed
+- Always uses most recent version
+
+### ✅ Comprehensive Reporting
+- Timestamped work directories
+- Service status details
+- OIDC configuration
+- Failed service logs
+- CLI usage examples
+
+## 📖 Additional Documentation
+
+- **`verification.conf`** - Main configuration file with all options
+- **`VM_CREATION_GUIDE.md`** - Complete VM auto-creation guide
+- **`CONFIG_AND_AUTH_TESTING.md`** - Configuration and OIDC testing details
+- **`TEST_RESULTS_SUCCESS.md`** - Example successful test results
+- **`FINAL_OIDC_STATUS_REPORT.md`** - Detailed OIDC analysis
+
 ## Common Issues and Solutions
 
 ### Issue: VM not found
-**Solution**: Verify VM name with `sudo virsh list --all`
+**Solution**: Either:
+- Set `CREATE_VM_IF_MISSING="true"` in `verification.conf` to auto-create VM
+- Create VM manually first
+- Verify VM name with `sudo virsh list --all`
 
 ### Issue: Cannot connect to VM
 **Solution**: 
