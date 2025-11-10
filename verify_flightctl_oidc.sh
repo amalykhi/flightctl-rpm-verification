@@ -534,10 +534,37 @@ start_services() {
     
     ssh_exec_sudo "systemctl start flightctl.target"
     
-    log_info "Waiting for services to start..."
-    sleep 15
+    log_info "Waiting for services to start and stabilize..."
     
-    log_success "Services started"
+    # Wait and check service status multiple times
+    local max_attempts=6
+    local wait_time=10
+    local attempt=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        sleep $wait_time
+        
+        local running=$(ssh_exec "systemctl list-units 'flightctl*' --no-legend | grep running | wc -l" || echo "0")
+        local activating=$(ssh_exec "systemctl list-units 'flightctl*' --no-legend | grep -E 'activating|auto-restart' | wc -l" || echo "0")
+        
+        log_info "Attempt $attempt/$max_attempts: $running services running, $activating services starting..."
+        
+        # If we have services running and nothing activating, we're good
+        if [ "$running" -ge 8 ] && [ "$activating" -eq 0 ]; then
+            log_success "Services are stable with $running services running"
+            return 0
+        fi
+        
+        # If no progress after several attempts, continue anyway
+        if [ $attempt -ge 4 ] && [ "$running" -ge 5 ]; then
+            log_warning "Some services still starting, but proceeding with $running services"
+            return 0
+        fi
+        
+        attempt=$((attempt + 1))
+    done
+    
+    log_warning "Services may still be starting after $((max_attempts * wait_time))s"
 }
 
 check_service_status() {
@@ -547,13 +574,13 @@ check_service_status() {
     local running_services=$(ssh_exec "systemctl list-units 'flightctl*' --no-legend | grep running | wc -l")
     log_success "Running services: ${running_services}"
     
-    # Get failed services
-    local failed_services=$(ssh_exec "systemctl list-units 'flightctl*' --no-legend | grep -E 'failed|auto-restart' | awk '{print \$1}'" || true)
+    # Get failed services (excluding 'not-found' which are optional)
+    local failed_services=$(ssh_exec "systemctl list-units 'flightctl*' --no-legend --state=failed,auto-restart --all | grep -v 'not-found' | awk '{print \$1}'" || true)
     
     if [ -n "$failed_services" ]; then
         log_warning "Failed/Auto-restarting services:"
         echo "$failed_services" | while read service; do
-            log_warning "  - $service"
+            [ -n "$service" ] && log_warning "  - $service"
         done
     fi
 }
@@ -561,47 +588,86 @@ check_service_status() {
 test_cli() {
     log_info "Testing FlightCtl CLI..."
     
-    # Login
-    ssh_exec "flightctl login https://${VM_IP}:3443 --insecure-skip-tls-verify" > /dev/null 2>&1 || true
+    local max_attempts=3
+    local attempt=1
     
-    # Test commands
-    if ssh_exec "flightctl get devices" > /dev/null 2>&1; then
-        log_success "CLI is working - can query devices"
-    else
-        log_error "CLI test failed"
-        return 1
-    fi
+    while [ $attempt -le $max_attempts ]; do
+        if [ $attempt -gt 1 ]; then
+            log_info "Retry attempt $attempt/$max_attempts..."
+            sleep 5
+        fi
+        
+        # Login
+        ssh_exec "flightctl login https://${VM_IP}:3443 --insecure-skip-tls-verify" > /dev/null 2>&1 || true
+        
+        # Test commands
+        if ssh_exec "flightctl get devices" > /dev/null 2>&1; then
+            log_success "CLI is working - can query devices"
+            
+            if ssh_exec "flightctl get fleets" > /dev/null 2>&1; then
+                log_success "CLI is working - can query fleets"
+            else
+                log_warning "CLI cannot query fleets"
+            fi
+            return 0
+        fi
+        
+        attempt=$((attempt + 1))
+    done
     
-    if ssh_exec "flightctl get fleets" > /dev/null 2>&1; then
-        log_success "CLI is working - can query fleets"
-    else
-        log_warning "CLI cannot query fleets"
-    fi
+    log_error "CLI test failed after $max_attempts attempts"
+    return 1
 }
 
 test_ui() {
     log_info "Testing FlightCtl UI..."
     
-    local ui_response=$(curl -k -s -o /dev/null -w "%{http_code}" "https://${VM_IP}:443")
+    local max_attempts=3
+    local attempt=1
     
-    if [ "$ui_response" = "200" ]; then
-        log_success "UI is accessible at https://${VM_IP}:443"
-    else
-        log_error "UI returned HTTP ${ui_response}"
-        return 1
-    fi
+    while [ $attempt -le $max_attempts ]; do
+        if [ $attempt -gt 1 ]; then
+            log_info "Retry attempt $attempt/$max_attempts..."
+            sleep 5
+        fi
+        
+        local ui_response=$(curl -k -s -o /dev/null -w "%{http_code}" "https://${VM_IP}:443")
+        
+        if [ "$ui_response" = "200" ]; then
+            log_success "UI is accessible at https://${VM_IP}:443"
+            return 0
+        fi
+        
+        attempt=$((attempt + 1))
+    done
+    
+    log_error "UI test failed after $max_attempts attempts - last response: HTTP ${ui_response}"
+    return 1
 }
 
 test_api() {
     log_info "Testing FlightCtl API..."
     
-    local api_response=$(ssh_exec "curl -k -s https://${VM_IP}:3443/api/v1/devices" | jq -r '.kind' 2>/dev/null || echo "")
+    local max_attempts=3
+    local attempt=1
     
-    if [ "$api_response" = "DeviceList" ]; then
-        log_success "API is working - returned DeviceList"
-    else
-        log_warning "API response unexpected: ${api_response}"
-    fi
+    while [ $attempt -le $max_attempts ]; do
+        if [ $attempt -gt 1 ]; then
+            log_info "Retry attempt $attempt/$max_attempts..."
+            sleep 5
+        fi
+        
+        local api_response=$(ssh_exec "curl -k -s https://${VM_IP}:3443/api/v1/devices" | jq -r '.kind' 2>/dev/null || echo "")
+        
+        if [ "$api_response" = "DeviceList" ]; then
+            log_success "API is working - returned DeviceList"
+            return 0
+        fi
+        
+        attempt=$((attempt + 1))
+    done
+    
+    log_warning "API test inconclusive after $max_attempts attempts"
 }
 
 check_oidc_status() {
