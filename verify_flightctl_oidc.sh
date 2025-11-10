@@ -91,11 +91,34 @@ ssh_exec() {
 }
 
 ssh_exec_sudo() {
-    sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${VM_USER}@${VM_IP}" "echo '${VM_PASSWORD}' | sudo -S $@"
+    sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${VM_USER}@${VM_IP}" "echo '${VM_PASSWORD}' | sudo -S -p '' $@" 2>&1 | grep -v '^\[sudo\]'
 }
 
 scp_to_vm() {
     sshpass -p "${VM_PASSWORD}" scp -o StrictHostKeyChecking=no "$1" "${VM_USER}@${VM_IP}:$2"
+}
+
+setup_passwordless_sudo() {
+    log_info "Setting up passwordless sudo for ${VM_USER}..."
+    
+    # Check if passwordless sudo is already configured
+    local sudo_check=$(ssh_exec "echo '${VM_PASSWORD}' | sudo -S -n true 2>&1; echo \$?")
+    
+    if echo "$sudo_check" | grep -q "^0$"; then
+        log_success "Passwordless sudo already configured"
+        return 0
+    fi
+    
+    # Set up passwordless sudo
+    local setup_result=$(sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no "${VM_USER}@${VM_IP}" \
+        "echo '${VM_PASSWORD}' | sudo -S bash -c 'echo \"${VM_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/${VM_USER} && chmod 0440 /etc/sudoers.d/${VM_USER}'" 2>&1)
+    
+    if [ $? -eq 0 ]; then
+        log_success "Passwordless sudo configured successfully"
+    else
+        log_warning "Could not set up passwordless sudo: ${setup_result}"
+        log_info "Will use password for sudo commands"
+    fi
 }
 
 ################################################################################
@@ -832,6 +855,7 @@ main() {
     echo ""
     
     get_vm_ip
+    setup_passwordless_sudo
     download_rpms
     copy_rpms_to_vm
     stop_old_services
