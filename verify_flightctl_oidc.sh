@@ -26,21 +26,42 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Configuration
-VM_NAME="${1:-eurolinux9}"
-RPM_URL_ARG="${2:-LATEST}"
-VM_USER="amalykhi"
-VM_PASSWORD=" "  # Single space character
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load configuration
+CONFIG_FILE="${1:-${SCRIPT_DIR}/verification.conf}"
+
+# Check for legacy command line args (VM_NAME, RPM_URL)
+if [ $# -eq 2 ] && [ ! -f "${1}" ]; then
+    # Legacy mode: first arg is VM_NAME, second is RPM_URL
+    VM_NAME="${1}"
+    RPM_URL_ARG="${2}"
+    CONFIG_FILE="${SCRIPT_DIR}/verification.conf"
+elif [ $# -eq 1 ] && [ ! -f "${1}" ]; then
+    # Legacy mode: first arg is VM_NAME
+    VM_NAME="${1}"
+    RPM_URL_ARG="LATEST"
+    CONFIG_FILE="${SCRIPT_DIR}/verification.conf"
+fi
+
+# Load configuration file
+if [ ! -f "${CONFIG_FILE}" ]; then
+    echo -e "${RED}[ERROR]${NC} Configuration file not found: ${CONFIG_FILE}"
+    echo "Please create verification.conf or specify a config file as the first argument."
+    exit 1
+fi
+
+echo -e "${BLUE}[INFO]${NC} Loading configuration from: ${CONFIG_FILE}"
+source "${CONFIG_FILE}"
+
+# Override from config if not set by command line
+VM_NAME="${VM_NAME:-${VM_NAME}}"
+RPM_URL_ARG="${RPM_URL_ARG:-${RPM_SOURCE:-LATEST}}"
+
+# Working directory
 WORK_DIR="$(pwd)/flightctl_verification_$(date +%Y%m%d_%H%M%S)"
 REPORT_FILE="${WORK_DIR}/verification_report.md"
-
-# Copr repository configuration
-COPR_BUILDS_URL="https://copr.fedorainfracloud.org/coprs/g/redhat-et/flightctl-dev/builds/"
-COPR_DOWNLOAD_BASE="https://download.copr.fedorainfracloud.org/results/@redhat-et/flightctl-dev/epel-9-x86_64"
-
-# OIDC Configuration
-OIDC_REALM="myrealm"
-OIDC_CLIENT_ID="my_client"
 
 # Will be set after determining the RPM URL
 RPM_BASE_URL=""
@@ -336,8 +357,22 @@ configure_oidc() {
     ssh_exec_sudo "systemctl unmask flightctl-api-init.service"
     ssh_exec_sudo "systemctl start flightctl-api-init.service"
     
-    # Wait for API init to complete
-    sleep 3
+    # Wait for API init to complete and config to be written
+    log_info "Waiting for API config generation..."
+    for i in {1..10}; do
+        if ssh_exec "test -f /etc/flightctl/flightctl-api/config.yaml"; then
+            log_success "API config generated successfully"
+            break
+        fi
+        sleep 1
+    done
+    
+    # Verify config was created
+    if ! ssh_exec "test -f /etc/flightctl/flightctl-api/config.yaml"; then
+        log_warning "API config was not generated, checking init service status..."
+        ssh_exec_sudo "systemctl status flightctl-api-init.service --no-pager | head -15"
+    fi
+    
     ssh_exec_sudo "systemctl mask flightctl-api-init.service"
     
     log_success "OIDC configuration updated"
@@ -436,6 +471,68 @@ check_oidc_status() {
     elif echo "$auth_status" | grep -q "Auth disabled"; then
         log_warning "Authentication is DISABLED in API"
         log_info "OIDC configuration is present but not active"
+    fi
+}
+
+test_oidc_authentication() {
+    log_info "Testing OIDC authentication with test user..."
+    
+    # Test Keycloak token endpoint
+    log_info "Testing Keycloak token endpoint..."
+    local token_response=$(ssh_exec "curl -s -X POST http://${VM_IP}:8080/realms/${OIDC_REALM}/protocol/openid-connect/token \
+        -d 'client_id=${OIDC_CLIENT_ID}' \
+        -d 'username=${TEST_USER}' \
+        -d 'password=${TEST_PASSWORD}' \
+        -d 'grant_type=password'" || echo "")
+    
+    if echo "$token_response" | grep -q "access_token"; then
+        log_success "Keycloak authentication successful for user: ${TEST_USER}"
+        
+        # Extract and display token info
+        local access_token=$(echo "$token_response" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
+        if [ -n "$access_token" ]; then
+            log_info "Access token obtained (first 50 chars): ${access_token:0:50}..."
+        fi
+    else
+        log_warning "Keycloak authentication failed for user: ${TEST_USER}"
+        log_info "Response: ${token_response}"
+    fi
+    
+    # Test FlightCtl CLI login
+    log_info "Testing FlightCtl CLI login..."
+    local insecure_flag=""
+    if [ "${INSECURE_SKIP_TLS_VERIFY:-true}" = "true" ]; then
+        insecure_flag="-k"
+    fi
+    
+    local login_result=$(ssh_exec "flightctl login https://${VM_IP}:3443 ${insecure_flag} \
+        --username ${TEST_USER} \
+        --password ${TEST_PASSWORD} \
+        --client-id ${OIDC_CLIENT_ID} 2>&1" || echo "")
+    
+    if echo "$login_result" | grep -q "Login successful"; then
+        log_success "FlightCtl CLI login successful for user: ${TEST_USER}"
+        
+        # Test querying devices with authenticated user
+        log_info "Testing authenticated API query (devices)..."
+        local devices_result=$(ssh_exec "flightctl get devices 2>&1" || echo "")
+        if echo "$devices_result" | grep -qE "NAME|ALIAS" || [ -z "$devices_result" ]; then
+            log_success "Can query devices with authenticated user"
+        else
+            log_warning "Device query returned error: ${devices_result}"
+        fi
+        
+        # Test querying fleets with authenticated user
+        log_info "Testing authenticated API query (fleets)..."
+        local fleets_result=$(ssh_exec "flightctl get fleets 2>&1" || echo "")
+        if echo "$fleets_result" | grep -qE "NAME|OWNER" || [ -z "$fleets_result" ]; then
+            log_success "Can query fleets with authenticated user"
+        else
+            log_warning "Fleet query returned error: ${fleets_result}"
+        fi
+    else
+        log_warning "FlightCtl CLI login failed for user: ${TEST_USER}"
+        log_info "Login result: ${login_result}"
     fi
 }
 
@@ -623,6 +720,7 @@ main() {
     test_ui
     test_api
     check_oidc_status
+    test_oidc_authentication
     
     echo ""
     collect_service_logs

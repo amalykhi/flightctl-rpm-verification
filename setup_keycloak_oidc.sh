@@ -3,24 +3,19 @@
 ################################################################################
 # Keycloak OIDC Setup Script for FlightCtl
 #
-# This script deploys Keycloak and configures it with:
-# - Realm: myrealm
-# - Client: my_client
-# - Test users with passwords
+# This script deploys Keycloak and configures it with OIDC realm, client,
+# and test users as defined in verification.conf
+#
+# Usage:
+#   ./setup_keycloak_oidc.sh [CONFIG_FILE] [VM_IP]
+#
+# Examples:
+#   ./setup_keycloak_oidc.sh                              # Use default config
+#   ./setup_keycloak_oidc.sh verification.conf           # Use specific config
+#   ./setup_keycloak_oidc.sh 192.168.122.219             # Legacy: VM IP only
 ################################################################################
 
 set -e
-
-VM_IP="${1:-192.168.122.219}"
-VM_USER="amalykhi"
-VM_PASSWORD=" "
-
-# Keycloak configuration
-KEYCLOAK_ADMIN="admin"
-KEYCLOAK_ADMIN_PASSWORD="admin"
-REALM_NAME="myrealm"
-CLIENT_ID="my_client"
-KEYCLOAK_PORT="8080"
 
 # Colors
 RED='\033[0;31m'
@@ -28,6 +23,36 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load configuration
+CONFIG_FILE="${1:-${SCRIPT_DIR}/verification.conf}"
+
+# Check for legacy mode (VM_IP as first arg)
+if [ $# -eq 1 ] && [[ "${1}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    # Legacy mode: first arg is VM_IP
+    VM_IP="${1}"
+    CONFIG_FILE="${SCRIPT_DIR}/verification.conf"
+elif [ $# -eq 2 ]; then
+    # Config file + VM IP override
+    VM_IP="${2}"
+fi
+
+# Load configuration file
+if [ ! -f "${CONFIG_FILE}" ]; then
+    echo -e "${RED}[ERROR]${NC} Configuration file not found: ${CONFIG_FILE}"
+    echo "Please create verification.conf or specify a config file."
+    exit 1
+fi
+
+echo -e "${BLUE}[INFO]${NC} Loading configuration from: ${CONFIG_FILE}"
+source "${CONFIG_FILE}"
+
+# Use config values (can be overridden by command line)
+REALM_NAME="${OIDC_REALM}"
+CLIENT_ID="${OIDC_CLIENT_ID}"
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -171,32 +196,32 @@ fi
 # Step 5: Create test users
 log_info "Creating test users..."
 
-# User 1: testuser
+# User 1: Test user from config
 USER1_CREATE=$(ssh_exec "curl -s -w '%{http_code}' -o /dev/null -X POST 'http://localhost:${KEYCLOAK_PORT}/admin/realms/${REALM_NAME}/users' \
   -H 'Authorization: Bearer ${ADMIN_TOKEN}' \
   -H 'Content-Type: application/json' \
   -d '{
-    \"username\": \"testuser\",
+    \"username\": \"${TEST_USER}\",
     \"enabled\": true,
-    \"email\": \"testuser@example.com\",
+    \"email\": \"${TEST_EMAIL}\",
     \"firstName\": \"Test\",
     \"lastName\": \"User\",
     \"emailVerified\": true
   }'")
 
 if [ "$USER1_CREATE" = "201" ] || [ "$USER1_CREATE" = "409" ]; then
-    log_success "User 'testuser' created (HTTP ${USER1_CREATE})"
+    log_success "User '${TEST_USER}' created (HTTP ${USER1_CREATE})"
     
     # Get user ID and set password
-    USER1_ID=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT}/admin/realms/${REALM_NAME}/users?username=testuser' \
+    USER1_ID=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT}/admin/realms/${REALM_NAME}/users?username=${TEST_USER}' \
       -H 'Authorization: Bearer ${ADMIN_TOKEN}' | jq -r '.[0].id'")
     
     if [ -n "$USER1_ID" ] && [ "$USER1_ID" != "null" ]; then
         ssh_exec "curl -s -X PUT 'http://localhost:${KEYCLOAK_PORT}/admin/realms/${REALM_NAME}/users/${USER1_ID}/reset-password' \
           -H 'Authorization: Bearer ${ADMIN_TOKEN}' \
           -H 'Content-Type: application/json' \
-          -d '{\"type\":\"password\",\"value\":\"password\",\"temporary\":false}'" >/dev/null
-        log_success "Password set for 'testuser'"
+          -d '{\"type\":\"password\",\"value\":\"${TEST_PASSWORD}\",\"temporary\":false}'" >/dev/null
+        log_success "Password set for '${TEST_USER}'"
     fi
 fi
 
@@ -244,15 +269,15 @@ fi
 log_info "Testing user authentication..."
 TEST_TOKEN=$(ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT}/realms/${REALM_NAME}/protocol/openid-connect/token' \
   -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'username=testuser' \
-  -d 'password=password' \
+  -d 'username=${TEST_USER}' \
+  -d 'password=${TEST_PASSWORD}' \
   -d 'grant_type=password' \
   -d 'client_id=${CLIENT_ID}' | jq -r '.access_token'")
 
 if [ "$TEST_TOKEN" != "null" ] && [ -n "$TEST_TOKEN" ]; then
-    log_success "User authentication test PASSED"
+    log_success "User authentication test PASSED for ${TEST_USER}"
 else
-    log_error "User authentication test FAILED"
+    log_error "User authentication test FAILED for ${TEST_USER}"
 fi
 
 echo ""
@@ -270,12 +295,13 @@ log_info "  Realm: ${REALM_NAME}"
 log_info "  Client ID: ${CLIENT_ID}"
 log_info "  OIDC Endpoint: http://${VM_IP}:${KEYCLOAK_PORT}/realms/${REALM_NAME}"
 echo ""
-log_info "Test Users:"
-log_info "  Username: testuser | Password: password"
-log_info "  Username: admin    | Password: admin123"
+log_info "Test User:"
+log_info "  Username: ${TEST_USER}"
+log_info "  Password: ${TEST_PASSWORD}"
+log_info "  Email: ${TEST_EMAIL}"
 echo ""
 log_info "Next Steps:"
 log_info "  1. Update FlightCtl to use: http://${VM_IP}:${KEYCLOAK_PORT}/realms/${REALM_NAME}"
 log_info "  2. Restart FlightCtl services"
-log_info "  3. Test login with testuser/password"
+log_info "  3. Test login with ${TEST_USER}/${TEST_PASSWORD}"
 
