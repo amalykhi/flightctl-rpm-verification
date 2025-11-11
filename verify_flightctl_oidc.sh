@@ -324,6 +324,37 @@ create_vm() {
     fi
 }
 
+wait_for_ssh() {
+    local max_wait=360  # 30 minutes (typical installation time)
+    local count=0
+    local vm_ip="$1"
+    
+    log_info "Waiting for SSH to become available on ${vm_ip}..."
+    log_info "This may take 10-30 minutes for fresh VM installation to complete"
+    
+    while [ $count -lt $max_wait ]; do
+        if sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${VM_USER}@${vm_ip}" "echo 'SSH Ready'" &>/dev/null 2>&1; then
+            log_success "SSH is now available on ${vm_ip}"
+            return 0
+        fi
+        
+        sleep 5
+        count=$((count + 1))
+        
+        # Log progress every minute
+        if [ $((count % 12)) -eq 0 ]; then
+            log_info "Still waiting for SSH... ($((count * 5))s / $((max_wait * 5))s elapsed)"
+            log_info "The VM OS installation is likely still in progress"
+        fi
+    done
+    
+    log_error "SSH did not become available within $((max_wait * 5)) seconds"
+    log_info "The VM installation may have failed or is taking longer than expected"
+    log_info "Check VM console with: sudo virsh console ${VM_NAME}"
+    log_info "Or check if installation needs manual interaction"
+    return 1
+}
+
 ensure_vm_exists() {
     if ! check_vm_exists; then
         if [ "${CREATE_VM_IF_MISSING}" = "true" ]; then
@@ -373,6 +404,12 @@ get_vm_ip() {
     fi
     
     log_success "VM is reachable"
+    
+    # Wait for SSH to become available (especially important for fresh installations)
+    if ! wait_for_ssh "${VM_IP}"; then
+        log_error "SSH is not available on ${VM_IP}"
+        exit 1
+    fi
 }
 
 download_rpms() {
