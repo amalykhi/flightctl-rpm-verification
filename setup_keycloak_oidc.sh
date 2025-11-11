@@ -192,17 +192,12 @@ CLIENT_CREATE_RESULT=$(ssh_exec "curl -s -w '%{http_code}' -o /dev/null -X POST 
     \"enabled\": true,
     \"publicClient\": true,
     \"redirectUris\": [
-      \"https://${VM_IP}:3443/*\",
-      \"https://${VM_IP}:443/*\",
-      \"https://${VM_IP}/*\",
-      \"http://localhost:*\",
-      \"urn:ietf:wg:oauth:2.0:oob\"
+      \"https://${VM_IP}:443/callback\",
+      \"http://127.0.0.1/callback\"
     ],
     \"webOrigins\": [
-      \"https://${VM_IP}:3443\",
-      \"https://${VM_IP}:443\",
-      \"https://${VM_IP}\",
-      \"http://localhost\"
+      \"http://127.0.0.1\",
+      \"https://${VM_IP}:443\"
     ],
     \"directAccessGrantsEnabled\": true,
     \"standardFlowEnabled\": true,
