@@ -202,10 +202,7 @@ CLIENT_CREATE_RESULT=$(ssh_exec "curl -s -w '%{http_code}' -o /dev/null -X POST 
     \"directAccessGrantsEnabled\": true,
     \"standardFlowEnabled\": true,
     \"implicitFlowEnabled\": false,
-    \"protocol\": \"openid-connect\",
-    \"attributes\": {
-      \"pkce.code.challenge.method\": \"S256\"
-    }
+    \"protocol\": \"openid-connect\"
   }'")
 
 if [ "$CLIENT_CREATE_RESULT" = "201" ] || [ "$CLIENT_CREATE_RESULT" = "409" ]; then
