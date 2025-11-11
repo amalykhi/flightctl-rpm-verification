@@ -87,8 +87,10 @@ log_info "Deploying Keycloak container..."
 ssh_exec_sudo "podman run -d --name keycloak \
   --restart always \
   -p ${KEYCLOAK_PORT}:8080 \
+  -p ${KEYCLOAK_HEALTH_PORT}:9000 \
   -e KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN} \
   -e KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD} \
+  -e KC_HEALTH_ENABLED=true \
   quay.io/keycloak/keycloak:latest \
   start-dev" 2>&1 || {
     log_info "Keycloak container may already exist, checking status..."
@@ -105,7 +107,7 @@ ssh_exec_sudo "podman run -d --name keycloak \
 
 log_info "Waiting for Keycloak to be ready (this may take 30-60 seconds)..."
 for i in {1..60}; do
-    if ssh_exec "curl -s http://localhost:${KEYCLOAK_PORT}/health/ready 2>/dev/null | grep -q '\"status\":\"UP\"'"; then
+    if ssh_exec "curl -s http://localhost:${KEYCLOAK_HEALTH_PORT}/health/ready 2>/dev/null | grep -q '\"status\":\ \"UP\"'"; then
         log_success "Keycloak is ready!"
         break
     fi
