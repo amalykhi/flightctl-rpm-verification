@@ -574,11 +574,13 @@ configure_oidc() {
     log_info "Regenerating API config from template..."
     ssh_exec_sudo "rm -f /etc/flightctl/flightctl-api/config.yaml"
     ssh_exec_sudo "systemctl unmask flightctl-api-init.service"
-    ssh_exec_sudo "systemctl start flightctl-api-init.service"
+    
+    # Use 'restart' to force re-execution of the oneshot service
+    ssh_exec_sudo "systemctl restart flightctl-api-init.service"
     
     # Wait for API init to complete and config to be written
     log_info "Waiting for API config generation..."
-    for i in {1..10}; do
+    for i in {1..15}; do
         if ssh_exec "test -f /etc/flightctl/flightctl-api/config.yaml"; then
             log_success "API config generated successfully"
             break
@@ -588,8 +590,12 @@ configure_oidc() {
     
     # Verify config was created
     if ! ssh_exec "test -f /etc/flightctl/flightctl-api/config.yaml"; then
-        log_warning "API config was not generated, checking init service status..."
-        ssh_exec_sudo "systemctl status flightctl-api-init.service --no-pager | head -15"
+        log_error "API config was not generated after 15 seconds"
+        log_info "Checking init service status..."
+        ssh_exec_sudo "systemctl status flightctl-api-init.service --no-pager -l"
+        log_info "Checking init service logs..."
+        ssh_exec_sudo "journalctl -u flightctl-api-init.service -n 30 --no-pager"
+        return 1
     fi
     
     ssh_exec_sudo "systemctl mask flightctl-api-init.service"
