@@ -91,7 +91,14 @@ ssh_exec() {
 }
 
 ssh_exec_sudo() {
-    sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${VM_USER}@${VM_IP}" "echo '${VM_PASSWORD}' | sudo -S -p '' $@" 2>&1 | grep -v '^\[sudo\]'
+    # Try passwordless sudo first, fall back to password if needed
+    if sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${VM_USER}@${VM_IP}" "sudo -n true 2>/dev/null"; then
+        # Passwordless sudo works
+        sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${VM_USER}@${VM_IP}" "sudo $@" 2>&1
+    else
+        # Use password
+        sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${VM_USER}@${VM_IP}" "echo '${VM_PASSWORD}' | sudo -S -p '' $@" 2>&1 | grep -v '^\[sudo\]'
+    fi
 }
 
 scp_to_vm() {
@@ -102,21 +109,20 @@ setup_passwordless_sudo() {
     log_info "Setting up passwordless sudo for ${VM_USER}..."
     
     # Check if passwordless sudo is already configured
-    local sudo_check=$(ssh_exec "echo '${VM_PASSWORD}' | sudo -S -n true 2>&1; echo \$?")
-    
-    if echo "$sudo_check" | grep -q "^0$"; then
+    if sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no "${VM_USER}@${VM_IP}" "sudo -n true 2>/dev/null"; then
         log_success "Passwordless sudo already configured"
         return 0
     fi
     
     # Set up passwordless sudo
-    local setup_result=$(sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no "${VM_USER}@${VM_IP}" \
-        "echo '${VM_PASSWORD}' | sudo -S bash -c 'echo \"${VM_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/${VM_USER} && chmod 0440 /etc/sudoers.d/${VM_USER}'" 2>&1)
+    sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no "${VM_USER}@${VM_IP}" \
+        "echo '${VM_PASSWORD}' | sudo -S bash -c 'echo \"${VM_USER} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/${VM_USER}-nopasswd && chmod 0440 /etc/sudoers.d/${VM_USER}-nopasswd'" 2>&1 | grep -v '^\[sudo\]'
     
-    if [ $? -eq 0 ]; then
+    # Verify it was set up correctly
+    if sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no "${VM_USER}@${VM_IP}" "sudo -n true 2>/dev/null"; then
         log_success "Passwordless sudo configured successfully"
     else
-        log_warning "Could not set up passwordless sudo: ${setup_result}"
+        log_warning "Could not set up passwordless sudo"
         log_info "Will use password for sudo commands"
     fi
 }
@@ -495,12 +501,21 @@ configure_oidc() {
     # Update main service config
     log_info "Updating /etc/flightctl/service-config.yaml..."
     
-    # Run sed commands separately to avoid quoting/escaping issues
-    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml"
-    ssh_exec_sudo "sed -i 's|baseDomain:.*|baseDomain: ${VM_IP}|' /etc/flightctl/service-config.yaml"
-    ssh_exec_sudo "sed -i 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml"
-    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml"
-    ssh_exec_sudo "sed -i 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' /etc/flightctl/service-config.yaml"
+    # Run sed commands separately with explicit error checking
+    log_info "  - Setting auth type to oidc..."
+    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml" || log_warning "Failed to set type"
+    
+    log_info "  - Setting baseDomain to ${VM_IP}..."
+    ssh_exec_sudo "sed -i 's|baseDomain:.*|baseDomain: ${VM_IP}|' /etc/flightctl/service-config.yaml" || log_warning "Failed to set baseDomain"
+    
+    log_info "  - Setting oidcAuthority..."
+    ssh_exec_sudo "sed -i 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml" || log_warning "Failed to set oidcAuthority"
+    
+    log_info "  - Setting externalOidcAuthority..."
+    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml" || log_warning "Failed to set externalOidcAuthority"
+    
+    log_info "  - Setting oidcClientId..."
+    ssh_exec_sudo "sed -i 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' /etc/flightctl/service-config.yaml" || log_warning "Failed to set oidcClientId"
     
     log_success "Service config updated"
     
