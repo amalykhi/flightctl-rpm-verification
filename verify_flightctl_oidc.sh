@@ -1031,6 +1031,11 @@ main() {
     log_info "  API: https://${VM_IP}:3443"
     log_info "  UI:  https://${VM_IP}:443"
     echo ""
+    log_info "Login Commands:"
+    log_info "  CLI (web): bin/flightctl login https://${VM_IP}:3443 -k --web --client-id=my_client"
+    log_info "  CLI (password): bin/flightctl login https://${VM_IP}:3443 -k -u testuser -p password --client-id=my_client"
+    log_info "  UI: https://${VM_IP}/"
+    echo ""
 }
 
 # Run main function
