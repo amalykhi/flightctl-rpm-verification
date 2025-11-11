@@ -118,6 +118,17 @@ ssh_exec_sudo "podman run -d --name keycloak \
     fi
 }
 
+# Step 2: Open firewall ports for Keycloak and FlightCtl
+log_info "Configuring firewall ports..."
+if ssh_exec "sudo firewall-cmd --state 2>/dev/null" | grep -q "running"; then
+    log_info "Opening ports: 8080 (Keycloak), 443 (UI), 3443 (API)..."
+    ssh_exec_sudo "firewall-cmd --permanent --add-port=8080/tcp --add-port=443/tcp --add-port=3443/tcp" > /dev/null 2>&1
+    ssh_exec_sudo "firewall-cmd --reload" > /dev/null 2>&1
+    log_success "Firewall ports opened"
+else
+    log_info "Firewall not running, skipping port configuration"
+fi
+
 log_info "Waiting for Keycloak to be ready (this may take 30-60 seconds)..."
 for i in {1..60}; do
     if ssh_exec "curl -s http://localhost:${KEYCLOAK_HEALTH_PORT}/health/ready 2>/dev/null | grep -q '\"status\":\ \"UP\"'"; then
@@ -133,7 +144,7 @@ for i in {1..60}; do
 done
 echo ""
 
-# Step 2: Get admin token
+# Step 3: Get admin token
 log_info "Authenticating with Keycloak admin..."
 ADMIN_TOKEN=$(ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT}/realms/master/protocol/openid-connect/token' \
   -H 'Content-Type: application/x-www-form-urlencoded' \
@@ -148,7 +159,7 @@ if [ "$ADMIN_TOKEN" = "null" ] || [ -z "$ADMIN_TOKEN" ]; then
 fi
 log_success "Admin token obtained"
 
-# Step 3: Create realm
+# Step 4: Create realm
 log_info "Creating realm '${REALM_NAME}'..."
 REALM_CREATE_RESULT=$(ssh_exec "curl -s -w '%{http_code}' -o /dev/null -X POST 'http://localhost:${KEYCLOAK_PORT}/admin/realms' \
   -H 'Authorization: Bearer ${ADMIN_TOKEN}' \
@@ -171,7 +182,7 @@ else
     log_error "Failed to create realm (HTTP ${REALM_CREATE_RESULT})"
 fi
 
-# Step 4: Create client
+# Step 5: Create client
 log_info "Creating client '${CLIENT_ID}'..."
 CLIENT_CREATE_RESULT=$(ssh_exec "curl -s -w '%{http_code}' -o /dev/null -X POST 'http://localhost:${KEYCLOAK_PORT}/admin/realms/${REALM_NAME}/clients' \
   -H 'Authorization: Bearer ${ADMIN_TOKEN}' \
@@ -208,7 +219,7 @@ else
     log_error "Failed to create client (HTTP ${CLIENT_CREATE_RESULT})"
 fi
 
-# Step 5: Create test users
+# Step 6: Create test users
 log_info "Creating test users..."
 
 # User 1: Test user from config
@@ -268,7 +279,7 @@ if [ "$USER2_CREATE" = "201" ] || [ "$USER2_CREATE" = "409" ]; then
     fi
 fi
 
-# Step 6: Verify configuration
+# Step 7: Verify configuration
 log_info "Verifying OIDC configuration..."
 OIDC_CONFIG=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT}/realms/${REALM_NAME}/.well-known/openid-configuration' | jq -r '.issuer'")
 
@@ -280,7 +291,7 @@ else
     exit 1
 fi
 
-# Step 7: Test user authentication
+# Step 8: Test user authentication
 log_info "Testing user authentication..."
 TEST_TOKEN=$(ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT}/realms/${REALM_NAME}/protocol/openid-connect/token' \
   -H 'Content-Type: application/x-www-form-urlencoded' \
