@@ -493,7 +493,58 @@ check_container_images() {
     fi
 }
 
+check_and_start_keycloak() {
+    log_info "Checking Keycloak status..."
+    
+    # Check if Keycloak container exists
+    local keycloak_exists=$(ssh_exec_sudo "podman ps -a --filter name=^keycloak$ --format '{{.Names}}' 2>/dev/null || true")
+    
+    if [ -z "$keycloak_exists" ]; then
+        log_warning "Keycloak container not found!"
+        log_info "Please run setup_keycloak_oidc.sh first to configure Keycloak"
+        return 1
+    fi
+    
+    # Check if Keycloak is running
+    local keycloak_running=$(ssh_exec_sudo "podman ps --filter name=^keycloak$ --format '{{.Names}}' 2>/dev/null || true")
+    
+    if [ -z "$keycloak_running" ]; then
+        log_warning "Keycloak is stopped. Starting it..."
+        ssh_exec_sudo "podman start keycloak"
+        
+        # Wait for Keycloak to be ready (up to 60 seconds)
+        log_info "Waiting for Keycloak to start (up to 60 seconds)..."
+        local ready=false
+        for i in {1..30}; do
+            if ssh_exec "curl -s http://localhost:8080/realms/${OIDC_REALM}/.well-known/openid-configuration 2>/dev/null | grep -q 'issuer'"; then
+                log_success "Keycloak is ready"
+                ready=true
+                break
+            fi
+            sleep 2
+        done
+        
+        if [ "$ready" = false ]; then
+            log_warning "Keycloak may not be fully ready, but continuing..."
+        fi
+    else
+        # Verify Keycloak is responsive
+        if ssh_exec "curl -s http://localhost:8080/realms/${OIDC_REALM}/.well-known/openid-configuration 2>/dev/null | grep -q 'issuer'"; then
+            log_success "Keycloak is running and responsive"
+        else
+            log_warning "Keycloak is running but not yet responsive, waiting..."
+            sleep 10
+        fi
+    fi
+}
+
 configure_oidc() {
+    # Ensure Keycloak is running before configuring OIDC
+    check_and_start_keycloak || {
+        log_error "Keycloak is not available. Cannot configure OIDC."
+        return 1
+    }
+    
     log_info "Configuring OIDC authentication..."
     
     local oidc_authority="http://${VM_IP}:8080/realms/${OIDC_REALM}"
