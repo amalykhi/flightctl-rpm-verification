@@ -66,6 +66,19 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Get VM IP if not already set
+if [ -z "${VM_IP}" ]; then
+    log_info "Resolving VM IP address for ${VM_NAME}..."
+    VM_IP=$(sudo virsh domifaddr "${VM_NAME}" 2>/dev/null | grep ipv4 | awk '{print $4}' | cut -d/ -f1)
+    
+    if [ -z "${VM_IP}" ]; then
+        log_error "Failed to get VM IP address for ${VM_NAME}"
+        log_error "Make sure the VM is running: sudo virsh start ${VM_NAME}"
+        exit 1
+    fi
+    log_success "VM IP: ${VM_IP}"
+fi
+
 ssh_exec() {
     sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no "${VM_USER}@${VM_IP}" "$@"
 }
