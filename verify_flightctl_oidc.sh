@@ -540,20 +540,44 @@ download_rpms() {
     
     if [ -n "$services_url" ]; then
         log_info "Downloading ${services_rpm}..."
-        wget -q "${services_url}" || {
-            log_error "Failed to download ${services_rpm}"
+        wget -q "${services_url}" 2>&1
+        # Check if file was actually downloaded
+        if [ -f "${services_rpm}" ] && [ -s "${services_rpm}" ]; then
+            log_success "Downloaded ${services_rpm}"
+        else
+            # Try to get HTTP error details
+            local wget_output=$(wget --spider "${services_url}" 2>&1)
+            if echo "$wget_output" | grep -q "403"; then
+                log_error "Access Forbidden (403) for ${services_rpm}"
+                log_error "Brew URLs require VPN/authentication. Please:"
+                log_error "  1. Connect to Red Hat VPN"
+                log_error "  2. Or download RPMs manually and place them in a directory"
+                log_error "  3. Or use Copr instead: RPM_SOURCE=\"LATEST\""
+            else
+                log_error "Failed to download ${services_rpm}"
+                log_error "URL: ${services_url}"
+            fi
             exit 1
-        }
-        log_success "Downloaded ${services_rpm}"
+        fi
     fi
     
     if [ -n "$cli_url" ]; then
         log_info "Downloading ${cli_rpm}..."
-        wget -q "${cli_url}" || {
-            log_error "Failed to download ${cli_rpm}"
+        wget -q "${cli_url}" 2>&1
+        # Check if file was actually downloaded
+        if [ -f "${cli_rpm}" ] && [ -s "${cli_rpm}" ]; then
+            log_success "Downloaded ${cli_rpm}"
+        else
+            local wget_output=$(wget --spider "${cli_url}" 2>&1)
+            if echo "$wget_output" | grep -q "403"; then
+                log_error "Access Forbidden (403) for ${cli_rpm}"
+                log_error "Brew URLs require VPN/authentication"
+            else
+                log_error "Failed to download ${cli_rpm}"
+                log_error "URL: ${cli_url}"
+            fi
             exit 1
-        }
-        log_success "Downloaded ${cli_rpm}"
+        fi
     fi
 }
 
