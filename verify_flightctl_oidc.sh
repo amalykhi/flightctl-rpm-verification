@@ -243,6 +243,11 @@ determine_rpm_url() {
     elif [[ "$RPM_URL_ARG" == *"brewweb.engineering.redhat.com/brew/taskinfo"* ]]; then
         log_info "Detected Brew task URL"
         get_brew_task_rpms "$RPM_URL_ARG"
+    elif [[ "$RPM_URL_ARG" == *".rpm" ]]; then
+        log_info "Detected direct RPM file URL"
+        # Extract directory URL from RPM file URL
+        RPM_BASE_URL=$(echo "$RPM_URL_ARG" | rev | cut -d'/' -f2- | rev)"/"
+        log_info "Extracted directory URL: ${RPM_BASE_URL}"
     elif [[ "$RPM_URL_ARG" == *"brewroot/work/tasks"* ]]; then
         log_info "Detected Brew download URL"
         # Ensure it ends with /
