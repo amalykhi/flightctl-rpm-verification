@@ -325,12 +325,12 @@ create_vm() {
 }
 
 wait_for_ssh() {
-    local max_wait=360  # 30 minutes (typical installation time)
+    local max_wait=720  # 60 minutes (for slow installations)
     local count=0
     local vm_ip="$1"
     
     log_info "Waiting for SSH to become available on ${vm_ip}..."
-    log_info "This may take 10-30 minutes for fresh VM installation to complete"
+    log_info "This may take 20-60 minutes for fresh VM installation to complete"
     
     while [ $count -lt $max_wait ]; do
         if sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${VM_USER}@${vm_ip}" "echo 'SSH Ready'" &>/dev/null 2>&1; then
