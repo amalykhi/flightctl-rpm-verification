@@ -255,7 +255,25 @@ create_vm() {
     
     # Add kickstart if provided
     if [ -n "${VM_KICKSTART_FILE}" ]; then
-        virt_install_cmd+=" --extra-args \"inst.ks=${VM_KICKSTART_FILE}\""
+        # Copy kickstart to a temporary location accessible during install
+        local ks_name="ks.cfg"
+        cp "${VM_KICKSTART_FILE}" "/tmp/${ks_name}"
+        
+        # Start a simple HTTP server on a random port to serve kickstart
+        local ks_port=8765
+        log_info "Starting temporary HTTP server for kickstart on port ${ks_port}..."
+        (cd /tmp && python3 -m http.server ${ks_port} > /dev/null 2>&1) &
+        local http_pid=$!
+        sleep 2  # Give server time to start
+        
+        # Get host IP that VM can reach
+        local host_ip=$(ip route get 8.8.8.8 | grep -oP 'src \K[\d.]+' | head -1)
+        
+        log_info "Kickstart will be served from: http://${host_ip}:${ks_port}/${ks_name}"
+        virt_install_cmd+=" --extra-args=\"inst.ks=http://${host_ip}:${ks_port}/${ks_name} console=ttyS0\""
+        
+        # Store HTTP server PID for cleanup
+        echo $http_pid > /tmp/ks_http_server.pid
     fi
     
     # Add cloud-init if provided
@@ -272,6 +290,15 @@ create_vm() {
     # Execute virt-install
     if eval "${virt_install_cmd}"; then
         log_success "VM creation started successfully"
+        
+        # Clean up kickstart HTTP server if it was started
+        if [ -f /tmp/ks_http_server.pid ]; then
+            local http_pid=$(cat /tmp/ks_http_server.pid)
+            sleep 10  # Give installer time to download kickstart
+            kill $http_pid 2>/dev/null || true
+            rm -f /tmp/ks_http_server.pid /tmp/ks.cfg
+            log_info "Kickstart HTTP server stopped"
+        fi
         
         # Wait for VM to be created
         log_info "Waiting for VM installation to complete..."
