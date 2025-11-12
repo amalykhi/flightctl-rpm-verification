@@ -155,6 +155,9 @@ get_brew_task_rpms() {
     local task_url="$1"
     log_info "Fetching RPMs from Brew task: ${task_url}"
     
+    # Ensure WORK_DIR exists
+    mkdir -p "${WORK_DIR}"
+    
     # Download the task page
     local task_html=$(curl -s -L "${task_url}" 2>&1)
     
@@ -163,17 +166,25 @@ get_brew_task_rpms() {
         exit 1
     fi
     
-    # Extract RPM download URLs (full URLs to .rpm files, excluding .src.rpm)
-    local base_url=$(echo "$task_html" | grep -oP 'href="https://[^"]+/brewroot/work/tasks/[^"]+\.rpm"' | \
-        head -1 | cut -d'"' -f2 | rev | cut -d'/' -f2- | rev)
+    # Extract all RPM download URLs directly from the task page (full URLs, excluding .src.rpm)
+    # Store them in a temporary file for later use
+    echo "$task_html" | grep -oP 'href="https://[^"]+/brewroot/work/[^"]+\.rpm"' | \
+        cut -d'"' -f2 | grep -v "\.src\.rpm" > "${WORK_DIR}/.brew_rpms.list"
     
-    if [ -z "$base_url" ]; then
-        log_error "Could not extract RPM base URL from Brew task page"
+    # Extract base URL from first RPM
+    local first_rpm=$(head -1 "${WORK_DIR}/.brew_rpms.list")
+    RPM_BASE_URL=$(echo "$first_rpm" | rev | cut -d'/' -f2- | rev)"/"
+    
+    if [ -z "$RPM_BASE_URL" ]; then
+        log_error "Could not extract RPM URLs from Brew task page"
         exit 1
     fi
     
-    RPM_BASE_URL="$base_url/"
+    # Mark this as a Brew source with direct URLs
+    BREW_DIRECT_URLS="true"
+    
     log_info "Extracted Brew RPM base URL: ${RPM_BASE_URL}"
+    log_info "Found $(wc -l < "${WORK_DIR}/.brew_rpms.list") RPM files"
 }
 
 get_latest_build_url() {
@@ -477,16 +488,24 @@ download_rpms() {
     mkdir -p "${WORK_DIR}"
     cd "${WORK_DIR}"
     
-    # Download index page
-    curl -L -s "${RPM_BASE_URL}" -o index.html
+    local rpm_files=""
     
-    # Extract RPM filenames
-    # Try Copr format first (relative URLs with single quotes)
-    local rpm_files=$(cat index.html | grep -oP "href='[^']*\.rpm'" | cut -d"'" -f2 | grep -v src.rpm)
-    
-    # If empty, try Brew format (absolute URLs with double quotes)
-    if [ -z "$rpm_files" ]; then
-        rpm_files=$(cat index.html | grep -oP 'href="[^"]*\.rpm"' | cut -d'"' -f2 | grep -v "\.src\.rpm" | rev | cut -d'/' -f1 | rev)
+    # Check if we have direct URLs from Brew
+    if [ -f "${WORK_DIR}/.brew_rpms.list" ]; then
+        # Extract just the filenames for display
+        rpm_files=$(cat "${WORK_DIR}/.brew_rpms.list" | rev | cut -d'/' -f1 | rev)
+    else
+        # Download index page for Copr/directory listing
+        curl -L -s "${RPM_BASE_URL}" -o index.html
+        
+        # Extract RPM filenames
+        # Try Copr format first (relative URLs with single quotes)
+        rpm_files=$(cat index.html | grep -oP "href='[^']*\.rpm'" | cut -d"'" -f2 | grep -v src.rpm)
+        
+        # If empty, try Brew format (absolute URLs with double quotes)
+        if [ -z "$rpm_files" ]; then
+            rpm_files=$(cat index.html | grep -oP 'href="[^"]*\.rpm"' | cut -d'"' -f2 | grep -v "\.src\.rpm" | rev | cut -d'/' -f1 | rev)
+        fi
     fi
     
     if [ -z "$rpm_files" ]; then
@@ -507,18 +526,30 @@ download_rpms() {
         cli_rpm=$(echo "$rpm_files" | grep -E "flightctl-[0-9]+\.[0-9]+.*x86_64\.rpm" | grep -v -E "services|agent|observability|telemetry" | head -1)
     fi
     
-    if [ -n "$services_rpm" ]; then
+    # Determine download URL format (Brew uses full URLs, others use base+filename)
+    local services_url cli_url
+    if [ -f "${WORK_DIR}/.brew_rpms.list" ]; then
+        # Brew: use full URLs from the list
+        services_url=$(cat "${WORK_DIR}/.brew_rpms.list" | grep "flightctl-services.*x86_64.rpm" | head -1)
+        cli_url=$(cat "${WORK_DIR}/.brew_rpms.list" | grep -E "flightctl-[0-9]+\.[0-9]+.*x86_64\.rpm" | grep -v -E "services|agent|observability|telemetry" | head -1)
+    else
+        # Copr/other: construct URLs from base + filename
+        services_url="${RPM_BASE_URL}${services_rpm}"
+        cli_url="${RPM_BASE_URL}${cli_rpm}"
+    fi
+    
+    if [ -n "$services_url" ]; then
         log_info "Downloading ${services_rpm}..."
-        wget -q "${RPM_BASE_URL}${services_rpm}" || {
+        wget -q "${services_url}" || {
             log_error "Failed to download ${services_rpm}"
             exit 1
         }
         log_success "Downloaded ${services_rpm}"
     fi
     
-    if [ -n "$cli_rpm" ]; then
+    if [ -n "$cli_url" ]; then
         log_info "Downloading ${cli_rpm}..."
-        wget -q "${RPM_BASE_URL}${cli_rpm}" || {
+        wget -q "${cli_url}" || {
             log_error "Failed to download ${cli_rpm}"
             exit 1
         }
@@ -571,7 +602,22 @@ remove_old_packages() {
 install_rpms() {
     log_info "Installing FlightCtl RPMs..."
     
-    ssh_exec_sudo "dnf install -y /tmp/flightctl-services-*.rpm /tmp/flightctl-cli-*.rpm"
+    # Find the actual RPM files (handle both Copr and Brew naming)
+    local services_rpm=$(ssh_exec "ls /tmp/flightctl-services-*.rpm 2>/dev/null | head -1")
+    # For CLI: try flightctl-cli first, then fall back to flightctl-X.X.X
+    local cli_rpm=$(ssh_exec "ls /tmp/flightctl-cli-*.rpm 2>/dev/null | head -1")
+    if [ -z "$cli_rpm" ]; then
+        cli_rpm=$(ssh_exec "ls /tmp/flightctl-[0-9]*.rpm 2>/dev/null | grep -v -E 'services|agent|observability|telemetry|selinux' | head -1")
+    fi
+    
+    if [ -z "$services_rpm" ] || [ -z "$cli_rpm" ]; then
+        log_error "Could not find required RPM files on VM"
+        log_info "Services RPM: ${services_rpm}"
+        log_info "CLI RPM: ${cli_rpm}"
+        exit 1
+    fi
+    
+    ssh_exec_sudo "dnf install -y ${services_rpm} ${cli_rpm}"
     
     log_success "RPMs installed successfully"
 }
