@@ -217,6 +217,14 @@ flightctl_verification_YYYYMMDD_HHMMSS/
 - **User**: `amalykhi` with password ` ` (single space)
 - **Access**: SSH access with sudo privileges
 - **Network**: Reachable from host machine
+- **Registry Access**: For Brew RPMs, login to Red Hat registry is required:
+
+```bash
+# Run on the VM
+sudo podman login registry.redhat.io -u <RH_username>
+```
+
+> **Note**: This is required when using Brew RPMs as they pull container images from `registry.redhat.io` which requires authentication. Copr builds use public registries and don't require this step.
 
 ### OIDC Settings (Customizable in script)
 

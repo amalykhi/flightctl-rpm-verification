@@ -443,11 +443,23 @@ ensure_vm_exists() {
         log_info "VM '${VM_NAME}' exists"
         
         # Check if VM is running, start if not
-        if ! sudo virsh list --state-running | grep -q "${VM_NAME}"; then
-            log_info "VM is not running. Starting..."
+        vm_state=$(sudo virsh list --all | grep -w "${VM_NAME}" | awk '{print $3, $4}' | xargs)
+        if [[ "$vm_state" == "shut off" ]]; then
+            log_info "VM is shut off. Starting VM..."
             if sudo virsh start "${VM_NAME}"; then
                 log_success "VM started successfully"
-                sleep 10  # Wait for boot
+                log_info "Waiting for VM to initialize properly (30 seconds)..."
+                sleep 30
+            else
+                log_error "Failed to start VM"
+                exit 1
+            fi
+        elif ! sudo virsh list --state-running | grep -q "${VM_NAME}"; then
+            log_info "VM is not in running state. Starting..."
+            if sudo virsh start "${VM_NAME}"; then
+                log_success "VM started successfully"
+                log_info "Waiting for VM to initialize properly (30 seconds)..."
+                sleep 30
             else
                 log_error "Failed to start VM"
                 exit 1
@@ -505,11 +517,11 @@ download_rpms() {
         
         # Extract RPM filenames
         # Try Copr format first (relative URLs with single quotes)
-        rpm_files=$(cat index.html | grep -oP "href='[^']*\.rpm'" | cut -d"'" -f2 | grep -v src.rpm)
+        rpm_files=$(grep -oP "href='[^']*\.rpm'" index.html 2>/dev/null | cut -d"'" -f2 | grep -v src.rpm || true)
         
         # If empty, try Brew format (absolute URLs with double quotes)
         if [ -z "$rpm_files" ]; then
-            rpm_files=$(cat index.html | grep -oP 'href="[^"]*\.rpm"' | cut -d'"' -f2 | grep -v "\.src\.rpm" | rev | cut -d'/' -f1 | rev)
+            rpm_files=$(grep -oP 'href="[^"]*\.rpm"' index.html 2>/dev/null | cut -d'"' -f2 | grep -v "\.src\.rpm" || true)
         fi
     fi
     
@@ -519,9 +531,9 @@ download_rpms() {
     fi
     
     log_info "Found RPM packages:"
-    echo "$rpm_files" | while read rpm; do
-        log_info "  - $rpm"
-    done
+    while IFS= read -r rpm; do
+        [ -n "$rpm" ] && log_info "  - $rpm"
+    done <<< "$rpm_files"
     
     # Download flightctl-services and flightctl-cli
     local services_rpm=$(echo "$rpm_files" | grep "flightctl-services.*x86_64.rpm" | head -1)
@@ -621,7 +633,7 @@ remove_old_packages() {
     
     if ssh_exec "rpm -qa | grep -q flightctl"; then
         log_info "Removing old packages..."
-        ssh_exec_sudo "dnf remove -y flightctl-services flightctl-cli flightctl-telemetry-gateway flightctl-observability" || true
+        ssh_exec_sudo "dnf remove -y flightctl-services flightctl-cli flightctl flightctl-telemetry-gateway flightctl-observability" || true
         log_success "Old packages removed"
     else
         log_info "No old packages to remove"
@@ -840,7 +852,41 @@ check_service_status() {
         echo "$failed_services" | while read service; do
             [ -n "$service" ] && log_warning "  - $service"
         done
+        
+        # Check logs for these failed services
+        check_service_logs "$failed_services"
     fi
+}
+
+check_service_logs() {
+    local failed_services="$1"
+    
+    if [ -z "$failed_services" ]; then
+        return 0
+    fi
+    
+    log_info "Checking logs for failed services..."
+    echo ""
+    
+    while IFS= read -r service; do
+        if [ -n "$service" ]; then
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_info "Logs for $service (last 30 lines with errors):"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            # Get recent logs with error keywords
+            local logs=$(ssh_exec "journalctl -u $service -n 50 --no-pager -o cat 2>/dev/null | grep -iE 'error|fail|fatal|panic|denied|refused|unauthorized|unable|cannot|invalid' | tail -30" || true)
+            
+            if [ -n "$logs" ]; then
+                echo "$logs"
+            else
+                # If no error keywords found, show last 20 lines
+                log_info "No explicit errors found, showing last 20 lines:"
+                ssh_exec "journalctl -u $service -n 20 --no-pager 2>/dev/null" || true
+            fi
+            echo ""
+        fi
+    done <<< "$failed_services"
 }
 
 test_cli() {
@@ -898,6 +944,11 @@ test_ui() {
     done
     
     log_error "UI test failed after $max_attempts attempts - last response: HTTP ${ui_response}"
+    
+    # Check logs for UI-related services
+    log_info "Checking UI service logs..."
+    check_service_logs "flightctl-ui.service"
+    
     return 1
 }
 
@@ -924,6 +975,10 @@ test_api() {
     done
     
     log_warning "API test inconclusive after $max_attempts attempts"
+    
+    # Check logs for API-related services
+    log_info "Checking API service logs..."
+    check_service_logs "flightctl-api.service"
 }
 
 check_oidc_status() {
