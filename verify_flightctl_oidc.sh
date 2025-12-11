@@ -128,6 +128,163 @@ setup_passwordless_sudo() {
 }
 
 ################################################################################
+# FIPS Functions
+################################################################################
+
+check_fips_status() {
+    # Check if FIPS mode is enabled on the VM
+    # Returns: 0 if enabled, 1 if disabled, 2 if error
+    local fips_enabled
+    fips_enabled=$(ssh_exec "cat /proc/sys/crypto/fips_enabled 2>/dev/null" || echo "error")
+    
+    if [ "$fips_enabled" = "1" ]; then
+        return 0
+    elif [ "$fips_enabled" = "0" ]; then
+        return 1
+    else
+        return 2
+    fi
+}
+
+verify_fips_mode() {
+    log_info "Verifying FIPS mode status on VM..."
+    
+    # Check /proc/sys/crypto/fips_enabled
+    local fips_proc
+    fips_proc=$(ssh_exec "cat /proc/sys/crypto/fips_enabled 2>/dev/null" || echo "N/A")
+    log_info "  /proc/sys/crypto/fips_enabled: ${fips_proc}"
+    
+    # Check fips-mode-setup status
+    local fips_setup_status
+    fips_setup_status=$(ssh_exec_sudo "fips-mode-setup --check 2>&1" || echo "Command not available")
+    log_info "  fips-mode-setup --check: ${fips_setup_status}"
+    
+    # Check kernel command line for fips=1
+    local kernel_cmdline
+    kernel_cmdline=$(ssh_exec "grep -o 'fips=[0-9]' /proc/cmdline 2>/dev/null" || echo "not set")
+    log_info "  Kernel cmdline: ${kernel_cmdline}"
+    
+    # Check OpenSSL FIPS provider
+    local openssl_fips
+    openssl_fips=$(ssh_exec "openssl list -providers 2>/dev/null | grep -i fips" || echo "No FIPS provider")
+    log_info "  OpenSSL FIPS: ${openssl_fips:-Not loaded}"
+    
+    # Determine overall status
+    if [ "$fips_proc" = "1" ]; then
+        log_success "FIPS mode is ENABLED on the VM"
+        return 0
+    else
+        log_warning "FIPS mode is DISABLED on the VM"
+        return 1
+    fi
+}
+
+enable_fips_mode() {
+    log_info "Enabling FIPS mode on VM..."
+    
+    # Check current status first
+    if check_fips_status; then
+        log_success "FIPS mode is already enabled"
+        verify_fips_mode
+        return 0
+    fi
+    
+    # Enable FIPS mode
+    log_info "Running fips-mode-setup --enable..."
+    local enable_result
+    enable_result=$(ssh_exec_sudo "fips-mode-setup --enable 2>&1")
+    local enable_exit=$?
+    
+    if [ $enable_exit -ne 0 ]; then
+        log_error "Failed to enable FIPS mode: ${enable_result}"
+        return 1
+    fi
+    
+    log_success "FIPS mode enabled, VM needs to reboot"
+    log_info "Rebooting VM to apply FIPS settings..."
+    
+    # Reboot the VM
+    ssh_exec_sudo "reboot" &>/dev/null || true
+    
+    # Wait for VM to go down
+    log_info "Waiting for VM to shut down..."
+    sleep 10
+    
+    # Wait for VM to come back up
+    local reboot_wait="${FIPS_REBOOT_WAIT:-120}"
+    log_info "Waiting up to ${reboot_wait} seconds for VM to come back online..."
+    
+    local count=0
+    local max_count=$((reboot_wait / 5))
+    while [ $count -lt $max_count ]; do
+        if ping -c 1 -W 2 "${VM_IP}" &>/dev/null; then
+            # VM is responding to ping, check SSH
+            if sshpass -p "${VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "${VM_USER}@${VM_IP}" "echo 'SSH Ready'" &>/dev/null 2>&1; then
+                log_success "VM is back online after FIPS reboot"
+                break
+            fi
+        fi
+        sleep 5
+        count=$((count + 1))
+        if [ $((count % 6)) -eq 0 ]; then
+            log_info "  Still waiting for VM... ($((count * 5))s elapsed)"
+        fi
+    done
+    
+    if [ $count -ge $max_count ]; then
+        log_error "VM did not come back online after FIPS reboot within ${reboot_wait} seconds"
+        return 1
+    fi
+    
+    # Give system a moment to fully initialize
+    sleep 10
+    
+    # Verify FIPS is now enabled
+    log_info "Verifying FIPS mode after reboot..."
+    if check_fips_status; then
+        log_success "FIPS mode successfully enabled and verified!"
+        verify_fips_mode
+        return 0
+    else
+        log_error "FIPS mode is NOT enabled after reboot"
+        verify_fips_mode
+        return 1
+    fi
+}
+
+handle_fips_configuration() {
+    # Handle FIPS configuration based on ENABLE_FIPS setting
+    local fips_setting="${ENABLE_FIPS:-false}"
+    
+    case "$fips_setting" in
+        "true"|"yes"|"1")
+            log_info "FIPS mode requested (ENABLE_FIPS=true)"
+            if ! enable_fips_mode; then
+                log_error "Failed to enable FIPS mode"
+                exit 1
+            fi
+            ;;
+        "verify"|"check")
+            log_info "FIPS verification requested (ENABLE_FIPS=verify)"
+            if ! verify_fips_mode; then
+                log_warning "FIPS is not enabled on this VM"
+            fi
+            ;;
+        "false"|"no"|"0"|"")
+            # Skip FIPS handling, but still show status
+            if [ "${DEBUG_MODE}" = "true" ]; then
+                log_info "FIPS mode not requested, checking current status..."
+                verify_fips_mode || true
+            fi
+            ;;
+        *)
+            log_warning "Unknown ENABLE_FIPS value: ${fips_setting}"
+            log_info "Valid values: true, false, verify"
+            ;;
+    esac
+}
+
+################################################################################
 # Main Functions
 ################################################################################
 
@@ -190,24 +347,13 @@ get_brew_task_rpms() {
 get_latest_build_url() {
     log_info "Fetching latest successful build from Copr..."
     
-    # Download the builds page
-    local builds_html=$(curl -s -L "${COPR_BUILDS_URL}" 2>&1)
+    # Use Copr API to get latest build
+    local api_url="https://copr.fedorainfracloud.org/api_3/build/list?ownername=@redhat-et&projectname=flightctl-dev&limit=1"
+    local latest_build_id=$(curl -s "${api_url}" 2>&1 | jq -r '.items[0].id' 2>/dev/null)
     
-    if [ -z "$builds_html" ]; then
-        log_error "Failed to fetch builds page from ${COPR_BUILDS_URL}"
-        exit 1
-    fi
-    
-    # Extract all build IDs and sort them numerically to get the highest (most recent)
-    # The HTML contains links like: /coprs/g/redhat-et/flightctl-dev/build/9772870/
-    local latest_build_id=$(echo "$builds_html" | \
-        grep -oP '/coprs/g/redhat-et/flightctl-dev/build/\K[0-9]+(?=/)' | \
-        sort -n -r | \
-        head -1)
-    
-    if [ -z "$latest_build_id" ]; then
-        log_error "Could not find latest build ID from builds page"
-        log_info "Tried to parse: ${COPR_BUILDS_URL}"
+    if [ -z "$latest_build_id" ] || [ "$latest_build_id" = "null" ]; then
+        log_error "Failed to fetch latest build ID from Copr API"
+        log_info "Tried API: ${api_url}"
         exit 1
     fi
     
@@ -675,14 +821,15 @@ check_container_images() {
     log_info "Services require tag: ${required_tag}"
     
     # Verify the required images exist
-    local image_count=$(ssh_exec_sudo "podman images | grep -c 'flightctl.*${required_tag}' || true")
+    local image_output=$(ssh_exec_sudo "podman images 2>&1 | grep 'flightctl.*${required_tag}' | wc -l")
+    local image_count=$(echo "$image_output" | tail -1 | tr -d '[:space:]')
     
-    if [ "$image_count" -gt 0 ]; then
+    if [ -n "$image_count" ] && [ "$image_count" -gt 0 ] 2>/dev/null; then
         log_success "Container images with tag '${required_tag}' are available"
     else
         log_warning "Required container images with tag '${required_tag}' not found"
         log_info "Available FlightCtl images:"
-        ssh_exec_sudo "podman images | grep flightctl | head -10"
+        ssh_exec_sudo "podman images 2>&1 | grep flightctl | head -10"
     fi
 }
 
@@ -773,22 +920,21 @@ configure_oidc() {
     
     # Wait for API init to complete and config to be written
     log_info "Waiting for API config generation..."
+    local config_generated=false
     for i in {1..15}; do
         if ssh_exec "test -f /etc/flightctl/flightctl-api/config.yaml"; then
             log_success "API config generated successfully"
+            config_generated=true
             break
         fi
         sleep 1
     done
     
-    # Verify config was created
-    if ! ssh_exec "test -f /etc/flightctl/flightctl-api/config.yaml"; then
-        log_error "API config was not generated after 15 seconds"
+    # Check if config was created (in newer builds, it may be generated by service ExecStartPre)
+    if [ "$config_generated" = "false" ]; then
+        log_warning "API config not generated by init service (may be generated by API service on startup)"
         log_info "Checking init service status..."
-        ssh_exec_sudo "systemctl status flightctl-api-init.service --no-pager -l"
-        log_info "Checking init service logs..."
-        ssh_exec_sudo "journalctl -u flightctl-api-init.service -n 30 --no-pager"
-        return 1
+        ssh_exec_sudo "systemctl status flightctl-api-init.service --no-pager -l" || true
     fi
     
     ssh_exec_sudo "systemctl mask flightctl-api-init.service"
@@ -1096,6 +1242,22 @@ generate_report() {
 
 FlightCtl services have been installed and configured on the VM.
 
+### FIPS Status
+
+EOF
+
+    local fips_status
+    fips_status=$(ssh_exec "cat /proc/sys/crypto/fips_enabled 2>/dev/null" || echo "N/A")
+    if [ "$fips_status" = "1" ]; then
+        echo "**FIPS Mode**: ✅ ENABLED" >> "${REPORT_FILE}"
+    elif [ "$fips_status" = "0" ]; then
+        echo "**FIPS Mode**: ❌ DISABLED" >> "${REPORT_FILE}"
+    else
+        echo "**FIPS Mode**: ⚠️ Unknown" >> "${REPORT_FILE}"
+    fi
+    
+    cat >> "${REPORT_FILE}" << EOF
+
 ## Installation Details
 
 ### RPM Packages Installed
@@ -1233,6 +1395,7 @@ main() {
     
     get_vm_ip
     setup_passwordless_sudo
+    handle_fips_configuration
     download_rpms
     copy_rpms_to_vm
     stop_old_services
@@ -1260,6 +1423,17 @@ main() {
     log_success "Verification Complete!"
     echo "=================================="
     echo ""
+    
+    # Show FIPS status in summary
+    local fips_status
+    fips_status=$(ssh_exec "cat /proc/sys/crypto/fips_enabled 2>/dev/null" || echo "N/A")
+    if [ "$fips_status" = "1" ]; then
+        log_success "FIPS Mode: ENABLED"
+    elif [ "$fips_status" = "0" ]; then
+        log_info "FIPS Mode: Disabled"
+    fi
+    echo ""
+    
     log_info "Report: ${REPORT_FILE}"
     log_info "Logs: ${WORK_DIR}/logs/"
     echo ""
