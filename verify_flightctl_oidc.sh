@@ -323,6 +323,14 @@ full_cleanup() {
     log_info "Removing podman volumes..."
     ssh_exec_sudo "podman volume prune -f 2>/dev/null" || true
     
+    # Clean up unused container images to free disk space
+    log_info "Pruning unused container images (this may take a moment)..."
+    ssh_exec_sudo "podman image prune -a -f 2>/dev/null" || true
+    
+    # Show disk usage after cleanup
+    log_info "Disk usage after cleanup:"
+    ssh_exec "df -h / | tail -1" || true
+    
     # Remove FlightCtl RPMs
     log_info "Removing FlightCtl RPMs..."
     ssh_exec_sudo "dnf remove -y 'flightctl*' 2>/dev/null" || true
@@ -336,10 +344,6 @@ full_cleanup() {
     log_info "Resetting systemd state..."
     ssh_exec_sudo "systemctl daemon-reload 2>/dev/null" || true
     ssh_exec_sudo "systemctl reset-failed 2>/dev/null" || true
-    
-    # Clean up container images (optional - keep to speed up reinstall)
-    # log_info "Removing container images..."
-    # ssh_exec_sudo "podman rmi -af 2>/dev/null" || true
     
     log_success "Full cleanup completed"
     echo ""
@@ -599,6 +603,43 @@ test_pam_authentication() {
     fi
 }
 
+# Switch API to use Keycloak OIDC (modifies service-config and restarts API)
+switch_to_keycloak() {
+    log_info "Switching API to Keycloak OIDC..."
+    
+    local oidc_authority="http://${VM_IP}:8080/realms/${OIDC_REALM}"
+    
+    # Update service config to use Keycloak OIDC
+    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml" || true
+    ssh_exec_sudo "sed -i 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml" || true
+    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml" || true
+    ssh_exec_sudo "sed -i 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' /etc/flightctl/service-config.yaml" || true
+    
+    # Restart API to pick up new config
+    log_info "Restarting API service..."
+    ssh_exec_sudo "systemctl restart flightctl-api.service"
+    sleep 5
+    
+    log_success "API switched to Keycloak OIDC"
+}
+
+# Switch API back to PAM Issuer
+switch_to_pam() {
+    log_info "Switching API back to PAM Issuer..."
+    
+    local pam_authority="https://${VM_IP}:8444/api/v1/auth"
+    
+    # Update service config to use PAM (type: none uses built-in PAM issuer)
+    ssh_exec_sudo "sed -i 's/type: oidc/type: none/' /etc/flightctl/service-config.yaml" || true
+    
+    # Restart API to pick up new config
+    log_info "Restarting API service..."
+    ssh_exec_sudo "systemctl restart flightctl-api.service"
+    sleep 5
+    
+    log_success "API switched back to PAM Issuer"
+}
+
 configure_auth() {
     local auth_type="${AUTH_TYPE:-both}"
     
@@ -606,18 +647,19 @@ configure_auth() {
     
     case "$auth_type" in
         "both"|"BOTH"|"all"|"ALL")
-            log_info "Configuring BOTH PAM Issuer and Keycloak..."
+            log_info "Configuring BOTH PAM Issuer and Keycloak (will test sequentially)..."
             echo ""
             log_info "═══════════════════════════════════════════════════════════"
-            log_info "Configuring PAM Issuer Authentication"
+            log_info "Step 1: Configuring PAM Issuer Authentication"
             log_info "═══════════════════════════════════════════════════════════"
             configure_pam_issuer
             create_pam_user
             echo ""
             log_info "═══════════════════════════════════════════════════════════"
-            log_info "Configuring Keycloak OIDC Authentication"
+            log_info "Step 2: Deploying Keycloak (will test after PAM)"
             log_info "═══════════════════════════════════════════════════════════"
-            configure_oidc || log_warning "Keycloak configuration failed (may not be installed)"
+            check_and_start_keycloak || log_warning "Keycloak deployment failed"
+            configure_keycloak_realm || log_warning "Keycloak realm configuration failed"
             ;;
         "pam"|"PAM")
             configure_pam_issuer
@@ -644,17 +686,34 @@ test_authentication() {
     
     case "$auth_type" in
         "both"|"BOTH"|"all"|"ALL")
+            # Sequential testing: PAM first, then Keycloak
             echo ""
             log_info "═══════════════════════════════════════════════════════════"
-            log_info "Testing PAM Issuer Authentication"
+            log_info "PHASE 1: Testing PAM Issuer Authentication"
             log_info "═══════════════════════════════════════════════════════════"
             test_pam_authentication
+            
+            # Now switch to Keycloak and test
             echo ""
             log_info "═══════════════════════════════════════════════════════════"
-            log_info "Testing Keycloak OIDC Authentication"
+            log_info "PHASE 2: Switching to Keycloak OIDC"
+            log_info "═══════════════════════════════════════════════════════════"
+            switch_to_keycloak
+            
+            echo ""
+            log_info "═══════════════════════════════════════════════════════════"
+            log_info "PHASE 2: Testing Keycloak OIDC Authentication"
             log_info "═══════════════════════════════════════════════════════════"
             check_oidc_status || true
             test_oidc_authentication || true
+            
+            # Switch back to PAM for normal operation
+            echo ""
+            log_info "═══════════════════════════════════════════════════════════"
+            log_info "Switching back to PAM Issuer (default)"
+            log_info "═══════════════════════════════════════════════════════════"
+            switch_to_pam
+            log_success "Both authentication methods tested sequentially"
             ;;
         "pam"|"PAM")
             test_pam_authentication
@@ -1689,8 +1748,7 @@ test_oidc_authentication() {
     
     local login_result=$(ssh_exec "flightctl login https://${VM_IP}:3443 ${insecure_flag} \
         --username ${TEST_USER} \
-        --password ${TEST_PASSWORD} \
-        --client-id ${OIDC_CLIENT_ID} 2>&1" || echo "")
+        --password ${TEST_PASSWORD} 2>&1" || echo "")
     
     if echo "$login_result" | grep -q "Login successful"; then
         log_success "FlightCtl CLI login successful for user: ${TEST_USER}"
