@@ -293,6 +293,59 @@ handle_fips_configuration() {
 }
 
 ################################################################################
+# Cleanup Functions
+################################################################################
+
+full_cleanup() {
+    log_info "Performing full cleanup..."
+    echo ""
+    
+    # Stop all FlightCtl services
+    log_info "Stopping FlightCtl services..."
+    ssh_exec_sudo "systemctl stop flightctl.target 2>/dev/null" || true
+    sleep 2
+    
+    # Stop all FlightCtl containers
+    log_info "Stopping FlightCtl containers..."
+    ssh_exec_sudo "podman stop -a 2>/dev/null" || true
+    sleep 2
+    
+    # Remove all FlightCtl containers
+    log_info "Removing FlightCtl containers..."
+    ssh_exec_sudo "podman rm -af 2>/dev/null" || true
+    
+    # Stop and remove Keycloak container
+    log_info "Removing Keycloak container..."
+    ssh_exec_sudo "podman stop keycloak 2>/dev/null" || true
+    ssh_exec_sudo "podman rm keycloak 2>/dev/null" || true
+    
+    # Remove podman volumes (database data, etc.)
+    log_info "Removing podman volumes..."
+    ssh_exec_sudo "podman volume prune -f 2>/dev/null" || true
+    
+    # Remove FlightCtl RPMs
+    log_info "Removing FlightCtl RPMs..."
+    ssh_exec_sudo "dnf remove -y 'flightctl*' 2>/dev/null" || true
+    
+    # Clean up config directories
+    log_info "Cleaning up config directories..."
+    ssh_exec_sudo "rm -rf /etc/flightctl 2>/dev/null" || true
+    ssh_exec_sudo "rm -rf /var/lib/flightctl 2>/dev/null" || true
+    
+    # Clean up systemd state
+    log_info "Resetting systemd state..."
+    ssh_exec_sudo "systemctl daemon-reload 2>/dev/null" || true
+    ssh_exec_sudo "systemctl reset-failed 2>/dev/null" || true
+    
+    # Clean up container images (optional - keep to speed up reinstall)
+    # log_info "Removing container images..."
+    # ssh_exec_sudo "podman rmi -af 2>/dev/null" || true
+    
+    log_success "Full cleanup completed"
+    echo ""
+}
+
+################################################################################
 # PAM Issuer Functions
 ################################################################################
 
@@ -1653,6 +1706,13 @@ main() {
     
     get_vm_ip
     setup_passwordless_sudo
+    
+    # Full cleanup if requested
+    if [ "${FULL_CLEANUP:-false}" = "true" ]; then
+        log_info "FULL_CLEANUP is enabled - cleaning up previous installation..."
+        full_cleanup
+    fi
+    
     handle_fips_configuration
     download_rpms
     copy_rpms_to_vm
