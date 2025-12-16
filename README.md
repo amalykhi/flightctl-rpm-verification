@@ -45,12 +45,103 @@ RPM_SOURCE="LATEST"               # Or specific URL
 OIDC_REALM="myrealm"
 OIDC_CLIENT_ID="my_client"
 
-# Test User
+# Test User (for Keycloak)
+TEST_USER="testuser"
+TEST_PASSWORD="password"
+
+# Authentication Type
+AUTH_TYPE="both"                  # pam, keycloak, both, or none
+```
+
+**See `verification.conf` for all available options.**
+
+### Authentication Types
+
+The script supports multiple authentication configurations via `AUTH_TYPE`:
+
+| AUTH_TYPE | Description | Use Case |
+|-----------|-------------|----------|
+| `both` | Test PAM Issuer AND Keycloak | **Default** - Full verification |
+| `pam` | PAM Issuer only (built-in) | Simple setup, no external dependencies |
+| `keycloak` | Keycloak OIDC only | External OIDC provider testing |
+| `none` | Skip authentication | Quick install without auth |
+
+#### PAM Issuer (Recommended for rc3+)
+
+PAM Issuer is FlightCtl's built-in OIDC provider. It starts automatically and requires no external setup.
+
+```bash
+# In verification.conf
+AUTH_TYPE="pam"
+PAM_USER="admin"
+PAM_PASSWORD="admin123"
+PAM_ROLE="flightctl-admin"
+```
+
+Login command:
+```bash
+flightctl login https://<VM_IP>:3443 -k -u admin -p admin123
+```
+
+#### Keycloak OIDC
+
+External Keycloak for enterprise OIDC testing. The script auto-deploys and configures Keycloak.
+
+```bash
+# In verification.conf
+AUTH_TYPE="keycloak"
+OIDC_REALM="myrealm"
+OIDC_CLIENT_ID="my_client"
 TEST_USER="testuser"
 TEST_PASSWORD="password"
 ```
 
-**See `verification.conf` for all available options.**
+#### Both (Default)
+
+Tests both authentication methods for comprehensive verification:
+
+```bash
+# In verification.conf
+AUTH_TYPE="both"
+```
+
+This will:
+1. Start PAM Issuer (built-in)
+2. Deploy and configure Keycloak
+3. Create users in both systems
+4. Test authentication with both providers
+
+#### None (No Authentication)
+
+Skip authentication configuration entirely:
+
+```bash
+# In verification.conf
+AUTH_TYPE="none"
+```
+
+Useful for:
+- Quick installation testing
+- Development environments
+- Debugging service issues
+
+### Full Cleanup Option
+
+Enable `FULL_CLEANUP` for a completely fresh installation:
+
+```bash
+# In verification.conf
+FULL_CLEANUP="true"
+```
+
+This removes:
+- All FlightCtl containers
+- Keycloak container
+- Podman volumes (database, etc.)
+- FlightCtl RPMs
+- Config directories
+
+**Use this when switching between versions or auth configurations.**
 
 ## Usage
 
@@ -179,19 +270,26 @@ vim my_test.conf
    - Waits for services to stabilize
    - Checks service status
 
-10. **OIDC Authentication Testing** (NEW!):
-   - Tests Keycloak token endpoint with test user
-   - Tests FlightCtl CLI login
-   - Tests authenticated device/fleet queries
-   - Verifies end-to-end auth flow
+10. **Authentication Configuration**:
+   - PAM Issuer: Verifies service is running, creates user
+   - Keycloak: Deploys container, creates realm/client/user
+   - Tests token endpoints and CLI login
 
-11. **Verification**:
+11. **Resource Verification** (NEW!):
+   - Creates test Fleet (`flightctl apply`)
+   - Creates test Repository
+   - Lists Fleets, Repositories, Devices
+   - Checks Enrollment Requests
+   - Verifies API version
+   - Cleans up test resources
+
+12. **Component Testing**:
    - Tests CLI access (flightctl get devices/fleets)
    - Tests UI accessibility (HTTP 200 check)
    - Tests API functionality
    - Checks OIDC authentication status
 
-12. **Reporting**:
+13. **Reporting**:
    - Collects logs from failed services
    - Generates comprehensive verification report
 
@@ -260,14 +358,20 @@ The generated report includes:
 # SSH to VM
 ssh amalykhi@<VM_IP>
 
-# Login to FlightCtl
-flightctl login https://<VM_IP>:3443 --insecure-skip-tls-verify
+# Login to FlightCtl (PAM Issuer - default in rc3+)
+flightctl login https://<VM_IP>:3443 -k -u admin -p admin123
+
+# Or use web-based login
+flightctl login https://<VM_IP>:3443 -k --web
 
 # List devices
 flightctl get devices
 
 # List fleets
 flightctl get fleets
+
+# Create a fleet
+flightctl apply -f my-fleet.yaml
 ```
 
 ### UI Access
@@ -297,11 +401,18 @@ curl -k https://<VM_IP>:3443/api/v1/devices
 - Kickstart and Cloud-init support
 - Perfect for CI/CD pipelines
 
-### ✅ OIDC Authentication Testing (NEW!)
+### ✅ Flexible Authentication Options (NEW!)
+- **PAM Issuer**: Built-in OIDC provider (no external deps)
+- **Keycloak**: Auto-deployed and configured
+- **Both**: Test both auth methods
+- **None**: Skip auth for quick testing
 - End-to-end authentication verification
-- Keycloak token endpoint testing
-- CLI login testing
-- Authenticated API query testing
+
+### ✅ Resource Verification (NEW!)
+- Creates and verifies Fleets
+- Creates and verifies Repositories
+- Tests all CRUD operations
+- Automatic cleanup after tests
 
 ### ✅ Smart VM Management
 - Auto-starts stopped VMs

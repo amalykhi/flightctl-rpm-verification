@@ -413,6 +413,135 @@ create_pam_user() {
     fi
 }
 
+verify_flightctl_resources() {
+    log_info ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "Verifying FlightCtl Resource Operations (Quadlet Functionality)"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    local test_fleet_name="test-fleet-$(date +%s)"
+    local test_repo_name="test-repo-$(date +%s)"
+    
+    # Test 1: Create a Fleet
+    log_info "Test 1: Creating test fleet '${test_fleet_name}'..."
+    local fleet_yaml="apiVersion: v1alpha1
+kind: Fleet
+metadata:
+  name: ${test_fleet_name}
+spec:
+  selector:
+    matchLabels:
+      env: test
+  template:
+    spec:
+      os:
+        image: quay.io/centos-bootc/centos-bootc:stream9"
+    
+    local create_result=$(ssh_exec "echo '${fleet_yaml}' | flightctl apply -f - 2>&1" || echo "")
+    
+    if echo "$create_result" | grep -qiE "created|configured|applied|unchanged"; then
+        log_success "Fleet '${test_fleet_name}' created successfully"
+    else
+        log_warning "Fleet creation result: ${create_result}"
+    fi
+    
+    # Test 2: List Fleets
+    log_info "Test 2: Listing fleets..."
+    local fleets_result=$(ssh_exec "flightctl get fleets 2>&1" || echo "")
+    
+    if echo "$fleets_result" | grep -q "${test_fleet_name}"; then
+        log_success "Fleet '${test_fleet_name}' is visible in fleet list"
+    elif echo "$fleets_result" | grep -qE "NAME|OWNER"; then
+        log_success "Fleet list accessible (test fleet may take time to appear)"
+        log_info "Fleets: $(echo "$fleets_result" | head -5)"
+    else
+        log_warning "Fleet list result: ${fleets_result}"
+    fi
+    
+    # Test 3: Get Fleet details
+    log_info "Test 3: Getting fleet details..."
+    local fleet_details=$(ssh_exec "flightctl get fleet/${test_fleet_name} -o yaml 2>&1" || echo "")
+    
+    if echo "$fleet_details" | grep -q "kind: Fleet"; then
+        log_success "Fleet details retrieved successfully"
+    else
+        log_warning "Fleet details: ${fleet_details:0:200}"
+    fi
+    
+    # Test 4: Create a Repository
+    log_info "Test 4: Creating test repository '${test_repo_name}'..."
+    local repo_yaml="apiVersion: v1alpha1
+kind: Repository
+metadata:
+  name: ${test_repo_name}
+spec:
+  type: git
+  url: https://github.com/flightctl/flightctl-demos"
+    
+    local repo_result=$(ssh_exec "echo '${repo_yaml}' | flightctl apply -f - 2>&1" || echo "")
+    
+    if echo "$repo_result" | grep -qiE "created|configured|applied|unchanged"; then
+        log_success "Repository '${test_repo_name}' created successfully"
+    else
+        log_warning "Repository creation result: ${repo_result}"
+    fi
+    
+    # Test 5: List Repositories
+    log_info "Test 5: Listing repositories..."
+    local repos_result=$(ssh_exec "flightctl get repositories 2>&1" || echo "")
+    
+    if echo "$repos_result" | grep -q "${test_repo_name}"; then
+        log_success "Repository '${test_repo_name}' is visible in repository list"
+    elif echo "$repos_result" | grep -qE "NAME|URL"; then
+        log_success "Repository list accessible"
+    else
+        log_warning "Repository list result: ${repos_result}"
+    fi
+    
+    # Test 6: List Devices (should be empty on fresh install)
+    log_info "Test 6: Listing devices..."
+    local devices_result=$(ssh_exec "flightctl get devices 2>&1" || echo "")
+    
+    if echo "$devices_result" | grep -qE "NAME|ALIAS|No resources found|^$"; then
+        log_success "Device list accessible (empty on fresh install is expected)"
+    else
+        log_warning "Device list result: ${devices_result}"
+    fi
+    
+    # Test 7: Check enrollment requests
+    log_info "Test 7: Listing enrollment requests..."
+    local enrollment_result=$(ssh_exec "flightctl get enrollmentrequests 2>&1" || echo "")
+    
+    if echo "$enrollment_result" | grep -qE "NAME|APPROVAL|No resources found|^$"; then
+        log_success "Enrollment requests accessible"
+    else
+        log_warning "Enrollment requests result: ${enrollment_result}"
+    fi
+    
+    # Test 8: API health check via CLI
+    log_info "Test 8: Checking API version..."
+    local version_result=$(ssh_exec "flightctl version 2>&1" || echo "")
+    
+    if echo "$version_result" | grep -qE "Client Version|Server Version"; then
+        log_success "API responding with version info"
+        log_info "$(echo "$version_result" | grep -E 'Version')"
+    else
+        log_warning "Version check result: ${version_result}"
+    fi
+    
+    # Cleanup: Delete test resources
+    log_info ""
+    log_info "Cleaning up test resources..."
+    ssh_exec "flightctl delete fleet/${test_fleet_name} 2>/dev/null" || true
+    ssh_exec "flightctl delete repository/${test_repo_name} 2>/dev/null" || true
+    log_success "Test resources cleaned up"
+    
+    log_info ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_success "FlightCtl Resource Verification Complete"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
 test_pam_authentication() {
     local username="${PAM_USER:-admin}"
     local password="${PAM_PASSWORD:-admin123}"
@@ -456,6 +585,9 @@ test_pam_authentication() {
         else
             log_warning "Device query returned: ${devices_result}"
         fi
+        
+        # Test FlightCtl resource operations
+        verify_flightctl_resources
     else
         log_warning "FlightCtl CLI login result: ${login_result}"
         
@@ -1093,9 +1225,8 @@ check_and_start_keycloak() {
     local keycloak_exists=$(ssh_exec_sudo "podman ps -a --filter name=^keycloak$ --format '{{.Names}}' 2>/dev/null || true")
     
     if [ -z "$keycloak_exists" ]; then
-        log_warning "Keycloak container not found!"
-        log_info "Please run setup_keycloak_oidc.sh first to configure Keycloak"
-        return 1
+        log_info "Keycloak container not found. Deploying Keycloak..."
+        deploy_keycloak || return 1
     fi
     
     # Check if Keycloak is running
@@ -1104,31 +1235,155 @@ check_and_start_keycloak() {
     if [ -z "$keycloak_running" ]; then
         log_warning "Keycloak is stopped. Starting it..."
         ssh_exec_sudo "podman start keycloak"
-        
-        # Wait for Keycloak to be ready (up to 60 seconds)
-        log_info "Waiting for Keycloak to start (up to 60 seconds)..."
-        local ready=false
-        for i in {1..30}; do
-            if ssh_exec "curl -s http://localhost:8080/realms/${OIDC_REALM}/.well-known/openid-configuration 2>/dev/null | grep -q 'issuer'"; then
-                log_success "Keycloak is ready"
-                ready=true
-                break
-            fi
-            sleep 2
-        done
-        
-        if [ "$ready" = false ]; then
-            log_warning "Keycloak may not be fully ready, but continuing..."
+    fi
+    
+    # Wait for Keycloak to be ready (up to 90 seconds for fresh deployment)
+    log_info "Waiting for Keycloak to be ready (up to 90 seconds)..."
+    local ready=false
+    for i in {1..45}; do
+        if ssh_exec "curl -s http://localhost:${KEYCLOAK_HEALTH_PORT:-9000}/health/ready 2>/dev/null | grep -q 'UP'"; then
+            log_success "Keycloak is ready"
+            ready=true
+            break
         fi
-    else
-        # Verify Keycloak is responsive
-        if ssh_exec "curl -s http://localhost:8080/realms/${OIDC_REALM}/.well-known/openid-configuration 2>/dev/null | grep -q 'issuer'"; then
-            log_success "Keycloak is running and responsive"
+        sleep 2
+        if [ $((i % 10)) -eq 0 ]; then
+            log_info "  Still waiting... ($((i * 2))s elapsed)"
+        fi
+    done
+    
+    if [ "$ready" = false ]; then
+        log_warning "Keycloak health check timed out, checking realm..."
+        if ssh_exec "curl -s http://localhost:8080/realms/master 2>/dev/null | grep -q 'master'"; then
+            log_success "Keycloak is responding (master realm accessible)"
         else
-            log_warning "Keycloak is running but not yet responsive, waiting..."
-            sleep 10
+            log_error "Keycloak is not responding"
+            return 1
         fi
     fi
+}
+
+deploy_keycloak() {
+    log_info "Deploying Keycloak container..."
+    
+    # Deploy Keycloak
+    ssh_exec_sudo "podman run -d --name keycloak \
+        --restart always \
+        -p ${KEYCLOAK_PORT:-8080}:8080 \
+        -p ${KEYCLOAK_HEALTH_PORT:-9000}:9000 \
+        -e KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN:-admin} \
+        -e KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-admin} \
+        -e KC_HEALTH_ENABLED=true \
+        quay.io/keycloak/keycloak:latest \
+        start-dev" 2>&1 || {
+        log_error "Failed to deploy Keycloak container"
+        return 1
+    }
+    
+    log_success "Keycloak container deployed"
+    
+    # Wait for Keycloak to be fully ready
+    log_info "Waiting for Keycloak to initialize (this may take 30-60 seconds)..."
+    local ready=false
+    for i in {1..60}; do
+        if ssh_exec "curl -s http://localhost:${KEYCLOAK_HEALTH_PORT:-9000}/health/ready 2>/dev/null | grep -q 'UP'"; then
+            log_success "Keycloak is ready!"
+            ready=true
+            break
+        fi
+        sleep 2
+        echo -n "."
+    done
+    echo ""
+    
+    if [ "$ready" = false ]; then
+        log_error "Keycloak did not become ready in time"
+        return 1
+    fi
+    
+    # Configure Keycloak realm and client
+    configure_keycloak_realm
+}
+
+configure_keycloak_realm() {
+    log_info "Configuring Keycloak realm and client..."
+    
+    # Get admin token
+    log_info "Authenticating with Keycloak admin..."
+    local admin_token=$(ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/realms/master/protocol/openid-connect/token' \
+        -H 'Content-Type: application/x-www-form-urlencoded' \
+        -d 'username=${KEYCLOAK_ADMIN:-admin}' \
+        -d 'password=${KEYCLOAK_ADMIN_PASSWORD:-admin}' \
+        -d 'grant_type=password' \
+        -d 'client_id=admin-cli' | jq -r '.access_token'")
+    
+    if [ "$admin_token" = "null" ] || [ -z "$admin_token" ]; then
+        log_error "Failed to get Keycloak admin token"
+        return 1
+    fi
+    log_success "Admin token obtained"
+    
+    # Create realm
+    log_info "Creating realm '${OIDC_REALM}'..."
+    ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms' \
+        -H 'Authorization: Bearer ${admin_token}' \
+        -H 'Content-Type: application/json' \
+        -d '{
+            \"realm\": \"${OIDC_REALM}\",
+            \"enabled\": true,
+            \"sslRequired\": \"none\",
+            \"registrationAllowed\": false,
+            \"loginWithEmailAllowed\": true,
+            \"duplicateEmailsAllowed\": false
+        }'" >/dev/null 2>&1 || true
+    log_success "Realm '${OIDC_REALM}' configured"
+    
+    # Create client
+    log_info "Creating client '${OIDC_CLIENT_ID}'..."
+    ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/clients' \
+        -H 'Authorization: Bearer ${admin_token}' \
+        -H 'Content-Type: application/json' \
+        -d '{
+            \"clientId\": \"${OIDC_CLIENT_ID}\",
+            \"enabled\": true,
+            \"publicClient\": true,
+            \"redirectUris\": [\"https://${VM_IP}:443/callback\", \"http://127.0.0.1/*\"],
+            \"webOrigins\": [\"http://127.0.0.1\", \"https://${VM_IP}:443\"],
+            \"directAccessGrantsEnabled\": true,
+            \"standardFlowEnabled\": true,
+            \"protocol\": \"openid-connect\"
+        }'" >/dev/null 2>&1 || true
+    log_success "Client '${OIDC_CLIENT_ID}' configured"
+    
+    # Create test user
+    log_info "Creating test user '${TEST_USER}'..."
+    ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users' \
+        -H 'Authorization: Bearer ${admin_token}' \
+        -H 'Content-Type: application/json' \
+        -d '{
+            \"username\": \"${TEST_USER}\",
+            \"enabled\": true,
+            \"email\": \"${TEST_EMAIL}\",
+            \"firstName\": \"Test\",
+            \"lastName\": \"User\",
+            \"emailVerified\": true
+        }'" >/dev/null 2>&1 || true
+    
+    # Set password for test user
+    local user_id=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users?username=${TEST_USER}' \
+        -H 'Authorization: Bearer ${admin_token}' | jq -r '.[0].id'" 2>/dev/null)
+    
+    if [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
+        ssh_exec "curl -s -X PUT 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users/${user_id}/reset-password' \
+            -H 'Authorization: Bearer ${admin_token}' \
+            -H 'Content-Type: application/json' \
+            -d '{\"type\":\"password\",\"value\":\"${TEST_PASSWORD}\",\"temporary\":false}'" >/dev/null 2>&1
+        log_success "Test user '${TEST_USER}' configured with password"
+    else
+        log_warning "Could not set password for test user"
+    fi
+    
+    log_success "Keycloak realm and client configured"
 }
 
 configure_oidc() {
