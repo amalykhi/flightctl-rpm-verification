@@ -1,17 +1,25 @@
 #!/bin/bash
 
 ################################################################################
-# FlightCtl OIDC Authentication Verification Script
+# FlightCtl Authentication Verification Script
 # 
 # This script automates the installation and verification of FlightCtl services
-# with OIDC authentication on a libvirt VM.
+# with configurable authentication on a libvirt VM.
+#
+# Supported Authentication Types (set AUTH_TYPE in verification.conf):
+#   - pam:      Built-in PAM Issuer (recommended, no external dependencies)
+#   - keycloak: External Keycloak OIDC provider
+#   - none:     No authentication
 #
 # Usage:
-#   ./verify_flightctl_oidc.sh <VM_NAME> <RPM_URL|LATEST>
+#   ./verify_flightctl_oidc.sh [VM_NAME] [RPM_URL|LATEST]
 #
 # Examples:
+#   # Use config file defaults
+#   ./verify_flightctl_oidc.sh
+#
 #   # Use specific build
-#   ./verify_flightctl_oidc.sh eurolinux9 https://download.copr.fedorainfracloud.org/results/@redhat-et/flightctl-dev/epel-9-x86_64/09772870-flightctl/
+#   ./verify_flightctl_oidc.sh eurolinux9 https://download.copr.fedorainfracloud.org/results/@redhat-et/flightctl/epel-9-x86_64/09903636-flightctl/
 #
 #   # Use latest successful build (automatically detected)
 #   ./verify_flightctl_oidc.sh eurolinux9 LATEST
@@ -280,6 +288,198 @@ handle_fips_configuration() {
         *)
             log_warning "Unknown ENABLE_FIPS value: ${fips_setting}"
             log_info "Valid values: true, false, verify"
+            ;;
+    esac
+}
+
+################################################################################
+# PAM Issuer Functions
+################################################################################
+
+configure_pam_issuer() {
+    log_info "Configuring PAM Issuer authentication..."
+    
+    # Check if PAM Issuer service is running (starts automatically with flightctl.target in rc3+)
+    if ! ssh_exec_sudo "systemctl is-active flightctl-pam-issuer.service" 2>/dev/null | grep -q "active"; then
+        log_warning "PAM Issuer service is not running"
+        log_info "This FlightCtl version may not include PAM Issuer or it failed to start"
+        log_info "Consider using AUTH_TYPE=keycloak instead"
+        return 1
+    fi
+    
+    log_success "PAM Issuer service is running"
+    
+    # Note: In FlightCtl rc3+, PAM Issuer starts automatically with flightctl.target
+    # and the default service-config.yaml is already configured to use it
+    
+    log_success "PAM Issuer configured successfully"
+}
+
+create_pam_user() {
+    local username="${1:-${PAM_USER:-admin}}"
+    local password="${2:-${PAM_PASSWORD:-admin123}}"
+    local role="${3:-${PAM_ROLE:-flightctl-admin}}"
+    
+    log_info "Creating PAM Issuer user: ${username} with role: ${role}..."
+    
+    # Check if PAM Issuer container is running
+    local container_name=$(ssh_exec_sudo "podman ps --format '{{.Names}}' 2>/dev/null" | grep -i "pam-issuer" || echo "")
+    if [ -z "$container_name" ]; then
+        log_error "PAM Issuer container is not running"
+        log_info "Available containers:"
+        ssh_exec_sudo "podman ps --format '{{.Names}}'" 2>/dev/null || true
+        return 1
+    fi
+    log_info "Found PAM Issuer container: ${container_name}"
+    
+    # Create role group if it doesn't exist
+    log_info "Creating role group: ${role}..."
+    ssh_exec_sudo "podman exec -i flightctl-pam-issuer groupadd ${role} 2>/dev/null" || true
+    
+    # Create user
+    log_info "Creating user: ${username}..."
+    ssh_exec_sudo "podman exec flightctl-pam-issuer adduser ${username} 2>/dev/null" || true
+    
+    # Set password
+    log_info "Setting password for ${username}..."
+    ssh_exec_sudo "podman exec -i flightctl-pam-issuer sh -c 'echo \"${username}:${password}\" | chpasswd'"
+    
+    # Add user to role group
+    log_info "Adding ${username} to ${role} group..."
+    ssh_exec_sudo "podman exec -i flightctl-pam-issuer usermod -aG ${role} ${username}"
+    
+    # Verify user
+    local user_groups=$(ssh_exec_sudo "podman exec flightctl-pam-issuer groups ${username}" 2>/dev/null || echo "")
+    
+    if echo "$user_groups" | grep -q "${role}"; then
+        log_success "User ${username} created with role ${role}"
+        log_info "User groups: ${user_groups}"
+    else
+        log_warning "User created but role assignment may have failed"
+        log_info "User groups: ${user_groups}"
+    fi
+}
+
+test_pam_authentication() {
+    local username="${PAM_USER:-admin}"
+    local password="${PAM_PASSWORD:-admin123}"
+    
+    log_info "Testing PAM Issuer authentication with user: ${username}..."
+    
+    # Check if PAM Issuer is accessible
+    local pam_issuer_url="https://${VM_IP}:8444/api/v1/auth"
+    log_info "PAM Issuer URL: ${pam_issuer_url}"
+    
+    # Test OIDC discovery endpoint
+    log_info "Testing OIDC discovery endpoint..."
+    local discovery_response=$(ssh_exec "curl -s -k ${pam_issuer_url}/.well-known/openid-configuration 2>&1" || echo "")
+    
+    if echo "$discovery_response" | grep -q "issuer"; then
+        log_success "PAM Issuer OIDC discovery endpoint is accessible"
+    else
+        log_warning "PAM Issuer OIDC discovery endpoint may not be ready"
+        log_info "Response: ${discovery_response:0:200}..."
+    fi
+    
+    # Test FlightCtl CLI login with PAM Issuer
+    log_info "Testing FlightCtl CLI login..."
+    local insecure_flag=""
+    if [ "${INSECURE_SKIP_TLS_VERIFY:-true}" = "true" ]; then
+        insecure_flag="-k"
+    fi
+    
+    local login_result=$(ssh_exec "flightctl login https://${VM_IP}:3443 ${insecure_flag} \
+        -u ${username} \
+        -p ${password} 2>&1" || echo "")
+    
+    if echo "$login_result" | grep -qiE "login successful|logged in|success"; then
+        log_success "FlightCtl CLI login successful for user: ${username}"
+        
+        # Test querying devices with authenticated user
+        log_info "Testing authenticated API query (devices)..."
+        local devices_result=$(ssh_exec "flightctl get devices 2>&1" || echo "")
+        if echo "$devices_result" | grep -qE "NAME|ALIAS|No resources found" || [ -z "$(echo "$devices_result" | grep -i error)" ]; then
+            log_success "Can query devices with authenticated user"
+        else
+            log_warning "Device query returned: ${devices_result}"
+        fi
+    else
+        log_warning "FlightCtl CLI login result: ${login_result}"
+        
+        # Try web-based login info
+        log_info ""
+        log_info "Manual login commands:"
+        log_info "  Web:      flightctl login https://${VM_IP}:3443 -k --web"
+        log_info "  Password: flightctl login https://${VM_IP}:3443 -k -u ${username} -p ${password}"
+    fi
+}
+
+configure_auth() {
+    local auth_type="${AUTH_TYPE:-both}"
+    
+    log_info "Configuring authentication (type: ${auth_type})..."
+    
+    case "$auth_type" in
+        "both"|"BOTH"|"all"|"ALL")
+            log_info "Configuring BOTH PAM Issuer and Keycloak..."
+            echo ""
+            log_info "═══════════════════════════════════════════════════════════"
+            log_info "Configuring PAM Issuer Authentication"
+            log_info "═══════════════════════════════════════════════════════════"
+            configure_pam_issuer
+            create_pam_user
+            echo ""
+            log_info "═══════════════════════════════════════════════════════════"
+            log_info "Configuring Keycloak OIDC Authentication"
+            log_info "═══════════════════════════════════════════════════════════"
+            configure_oidc || log_warning "Keycloak configuration failed (may not be installed)"
+            ;;
+        "pam"|"PAM")
+            configure_pam_issuer
+            create_pam_user
+            ;;
+        "keycloak"|"KEYCLOAK"|"oidc"|"OIDC")
+            configure_oidc
+            ;;
+        "none"|"NONE"|"")
+            log_info "Authentication disabled (AUTH_TYPE=none)"
+            ssh_exec_sudo "sed -i 's/type: oidc/type: none/' /etc/flightctl/service-config.yaml" || true
+            ssh_exec_sudo "sed -i 's/type: pam/type: none/' /etc/flightctl/service-config.yaml" || true
+            ;;
+        *)
+            log_error "Unknown AUTH_TYPE: ${auth_type}"
+            log_info "Valid options: both, pam, keycloak, none"
+            exit 1
+            ;;
+    esac
+}
+
+test_authentication() {
+    local auth_type="${AUTH_TYPE:-both}"
+    
+    case "$auth_type" in
+        "both"|"BOTH"|"all"|"ALL")
+            echo ""
+            log_info "═══════════════════════════════════════════════════════════"
+            log_info "Testing PAM Issuer Authentication"
+            log_info "═══════════════════════════════════════════════════════════"
+            test_pam_authentication
+            echo ""
+            log_info "═══════════════════════════════════════════════════════════"
+            log_info "Testing Keycloak OIDC Authentication"
+            log_info "═══════════════════════════════════════════════════════════"
+            check_oidc_status || true
+            test_oidc_authentication || true
+            ;;
+        "pam"|"PAM")
+            test_pam_authentication
+            ;;
+        "keycloak"|"KEYCLOAK"|"oidc"|"OIDC")
+            check_oidc_status
+            test_oidc_authentication
+            ;;
+        "none"|"NONE"|"")
+            log_info "Authentication testing skipped (AUTH_TYPE=none)"
             ;;
     esac
 }
@@ -1231,12 +1431,15 @@ collect_service_logs() {
 generate_report() {
     log_info "Generating verification report..."
     
+    local auth_type="${AUTH_TYPE:-pam}"
+    
     cat > "${REPORT_FILE}" << EOF
-# FlightCtl OIDC Authentication Verification Report
+# FlightCtl Authentication Verification Report
 
 **Date**: $(date '+%B %d, %Y at %H:%M:%S')  
 **VM**: ${VM_NAME} (${VM_IP})  
-**RPM Source**: ${RPM_BASE_URL}
+**RPM Source**: ${RPM_BASE_URL}  
+**Authentication Type**: ${auth_type}
 
 ## Summary
 
@@ -1300,7 +1503,9 @@ EOF
     
     cat >> "${REPORT_FILE}" << EOF
 
-## OIDC Configuration
+## Authentication Configuration
+
+**Type**: ${auth_type}
 
 ### Configuration Files
 
@@ -1331,6 +1536,23 @@ EOF
     local auth_status=$(ssh_exec_sudo "podman logs flightctl-api 2>&1 | grep -E 'OIDC auth enabled|Auth disabled' | tail -1" || echo "Unknown")
     echo "**API Auth Status**: \`${auth_status}\`" >> "${REPORT_FILE}"
     
+    # Add PAM Issuer specific info
+    if [ "$auth_type" = "pam" ] || [ "$auth_type" = "PAM" ] || [ "$auth_type" = "both" ] || [ "$auth_type" = "BOTH" ]; then
+        cat >> "${REPORT_FILE}" << EOF
+
+### PAM Issuer Users
+
+EOF
+        echo "**Configured User**: ${PAM_USER:-admin} (role: ${PAM_ROLE:-flightctl-admin})" >> "${REPORT_FILE}"
+        echo "" >> "${REPORT_FILE}"
+        echo "To add more users:" >> "${REPORT_FILE}"
+        echo "\`\`\`bash" >> "${REPORT_FILE}"
+        echo "sudo podman exec flightctl-pam-issuer adduser <username>" >> "${REPORT_FILE}"
+        echo "sudo podman exec -i flightctl-pam-issuer sh -c 'echo \"<username>:<password>\" | chpasswd'" >> "${REPORT_FILE}"
+        echo "sudo podman exec -i flightctl-pam-issuer usermod -aG flightctl-admin <username>" >> "${REPORT_FILE}"
+        echo "\`\`\`" >> "${REPORT_FILE}"
+    fi
+    
     cat >> "${REPORT_FILE}" << EOF
 
 ## Access Points
@@ -1346,8 +1568,44 @@ EOF
 ## CLI Configuration
 
 \`\`\`bash
-# Login to FlightCtl
-flightctl login https://${VM_IP}:3443 --insecure-skip-tls-verify
+EOF
+
+    # Add auth-specific login command
+    if [ "$auth_type" = "both" ] || [ "$auth_type" = "BOTH" ]; then
+        cat >> "${REPORT_FILE}" << EOF
+# Login to FlightCtl (PAM Issuer - recommended)
+flightctl login https://${VM_IP}:3443 -k -u ${PAM_USER:-admin} -p ${PAM_PASSWORD:-admin123}
+
+# Login to FlightCtl (Keycloak - if configured)
+flightctl login https://${VM_IP}:3443 -k -u ${TEST_USER} -p ${TEST_PASSWORD}
+
+# Or use web-based login (works with either provider)
+flightctl login https://${VM_IP}:3443 -k --web
+EOF
+    elif [ "$auth_type" = "pam" ] || [ "$auth_type" = "PAM" ]; then
+        cat >> "${REPORT_FILE}" << EOF
+# Login to FlightCtl (PAM Issuer)
+flightctl login https://${VM_IP}:3443 -k -u ${PAM_USER:-admin} -p ${PAM_PASSWORD:-admin123}
+
+# Or use web-based login
+flightctl login https://${VM_IP}:3443 -k --web
+EOF
+    elif [ "$auth_type" = "keycloak" ] || [ "$auth_type" = "KEYCLOAK" ]; then
+        cat >> "${REPORT_FILE}" << EOF
+# Login to FlightCtl (Keycloak)
+flightctl login https://${VM_IP}:3443 -k -u ${TEST_USER} -p ${TEST_PASSWORD}
+
+# Or use web-based login
+flightctl login https://${VM_IP}:3443 -k --web
+EOF
+    else
+        cat >> "${REPORT_FILE}" << EOF
+# Authentication disabled - direct access
+flightctl login https://${VM_IP}:3443 -k
+EOF
+    fi
+
+    cat >> "${REPORT_FILE}" << EOF
 
 # List devices
 flightctl get devices
@@ -1402,17 +1660,16 @@ main() {
     remove_old_packages
     install_rpms
     check_container_images
-    configure_oidc
     start_services
     check_service_status
+    configure_auth
     
     echo ""
     log_info "Testing FlightCtl components..."
     test_cli
     test_ui
     test_api
-    check_oidc_status
-    test_oidc_authentication
+    test_authentication
     
     echo ""
     collect_service_logs
@@ -1441,9 +1698,40 @@ main() {
     log_info "  API: https://${VM_IP}:3443"
     log_info "  UI:  https://${VM_IP}:443"
     echo ""
+    
+    # Show login commands based on AUTH_TYPE
+    local auth_type="${AUTH_TYPE:-both}"
+    log_info "Authentication Type: ${auth_type}"
     log_info "Login Commands:"
-    log_info "  CLI (web): bin/flightctl login https://${VM_IP}:3443 -k --web --client-id=my_client"
-    log_info "  CLI (password): bin/flightctl login https://${VM_IP}:3443 -k -u testuser -p password --client-id=my_client"
+    
+    case "$auth_type" in
+        "both"|"BOTH"|"all"|"ALL")
+            local pam_user="${PAM_USER:-admin}"
+            local pam_pass="${PAM_PASSWORD:-admin123}"
+            log_info ""
+            log_info "  PAM Issuer (recommended):"
+            log_info "    Web:      flightctl login https://${VM_IP}:3443 -k --web"
+            log_info "    Password: flightctl login https://${VM_IP}:3443 -k -u ${pam_user} -p ${pam_pass}"
+            log_info ""
+            log_info "  Keycloak (if configured):"
+            log_info "    Web:      flightctl login https://${VM_IP}:3443 -k --web"
+            log_info "    Password: flightctl login https://${VM_IP}:3443 -k -u ${TEST_USER} -p ${TEST_PASSWORD}"
+            ;;
+        "pam"|"PAM")
+            local pam_user="${PAM_USER:-admin}"
+            local pam_pass="${PAM_PASSWORD:-admin123}"
+            log_info "  CLI (web):      flightctl login https://${VM_IP}:3443 -k --web"
+            log_info "  CLI (password): flightctl login https://${VM_IP}:3443 -k -u ${pam_user} -p ${pam_pass}"
+            ;;
+        "keycloak"|"KEYCLOAK"|"oidc"|"OIDC")
+            log_info "  CLI (web):      flightctl login https://${VM_IP}:3443 -k --web"
+            log_info "  CLI (password): flightctl login https://${VM_IP}:3443 -k -u ${TEST_USER} -p ${TEST_PASSWORD}"
+            ;;
+        "none"|"NONE"|"")
+            log_info "  Authentication disabled - no login required"
+            ;;
+    esac
+    
     log_info "  UI: https://${VM_IP}/"
     echo ""
 }
