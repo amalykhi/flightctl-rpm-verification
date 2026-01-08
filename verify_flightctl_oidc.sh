@@ -645,20 +645,34 @@ switch_to_keycloak() {
     local oidc_authority="http://${VM_IP}:8080/realms/${OIDC_REALM}"
     log_info "Keycloak OIDC Authority: ${oidc_authority}"
     
-    # Directly update the API config file to use Keycloak as OIDC issuer
-    # The api-init service regenerates config from hostname, so we modify the final config directly
-    log_info "Updating API config to use Keycloak issuer..."
-    ssh_exec_sudo "sed -i 's|issuer:.*|issuer: ${oidc_authority}|' /etc/flightctl/flightctl-api/config.yaml" || true
-    ssh_exec_sudo "sed -i 's|clientId:.*|clientId: ${OIDC_CLIENT_ID}|' /etc/flightctl/flightctl-api/config.yaml" || true
+    # IMPORTANT: Modify service-config.yaml (not the generated config.yaml)
+    # The ExecStartPre in flightctl-api.service regenerates config.yaml from template
+    # We need to:
+    # 1. Disable pamOidcIssuer.enabled
+    # 2. Set oidc.issuer to Keycloak URL
+    # 3. Set oidc.clientId to Keycloak client
     
-    # Show the updated config
-    log_info "Updated OIDC config:"
-    ssh_exec "grep -A5 'oidc:' /etc/flightctl/flightctl-api/config.yaml" || true
+    log_info "Updating service-config.yaml for Keycloak..."
     
-    # Restart API to pick up new config
+    # Disable PAM Issuer by setting enabled: false in pamOidcIssuer section
+    ssh_exec_sudo "sed -i '/pamOidcIssuer:/,/clientSecret:/ s/enabled: true/enabled: false/' /etc/flightctl/service-config.yaml" || true
+    
+    # Set issuer in oidc section (the empty one after clientId: flightctl-client)
+    # First check if issuer is empty and set it
+    ssh_exec_sudo "sed -i 's|issuer:$|issuer: ${oidc_authority}|' /etc/flightctl/service-config.yaml" || true
+    ssh_exec_sudo "sed -i 's|issuer: $|issuer: ${oidc_authority}|' /etc/flightctl/service-config.yaml" || true
+    
+    # Update clientId in the oidc section
+    ssh_exec_sudo "sed -i 's|clientId: flightctl-client|clientId: ${OIDC_CLIENT_ID}|' /etc/flightctl/service-config.yaml" || true
+    
+    # Restart API service (ExecStartPre will regenerate config.yaml from updated service-config.yaml)
     log_info "Restarting API service..."
     ssh_exec_sudo "systemctl restart flightctl-api.service"
     sleep 5
+    
+    # Show the generated config
+    log_info "Updated OIDC config:"
+    ssh_exec "grep -A5 'oidc:' /etc/flightctl/flightctl-api/config.yaml" || true
     
     log_success "API switched to Keycloak OIDC"
 }
@@ -667,20 +681,17 @@ switch_to_keycloak() {
 switch_to_pam() {
     log_info "Switching API back to PAM Issuer..."
     
-    # Update service config - set type to oidc (issuer auto-detected from hostname)
-    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml" || true
-    ssh_exec_sudo "sed -i 's/type: aap/type: oidc/' /etc/flightctl/service-config.yaml" || true
+    # Re-enable PAM Issuer in service-config.yaml
+    ssh_exec_sudo "sed -i '/pamOidcIssuer:/,/clientSecret:/ s/enabled: false/enabled: true/' /etc/flightctl/service-config.yaml" || true
     
-    # Clear any Keycloak OIDC config (use PAM instead)
-    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"\"|' /etc/flightctl/service-config.yaml" || true
+    # Reset clientId back to default
+    ssh_exec_sudo "sed -i 's|clientId: ${OIDC_CLIENT_ID:-my_client}|clientId: flightctl-client|' /etc/flightctl/service-config.yaml" || true
     
-    # Regenerate API config and restart (issuer will be auto-configured from hostname)
+    # Clear issuer (will be auto-detected from hostname)
+    ssh_exec_sudo "sed -i 's|issuer: http://.*|issuer:|' /etc/flightctl/service-config.yaml" || true
+    
+    # Restart API service (ExecStartPre will regenerate config.yaml)
     log_info "Regenerating API config and restarting..."
-    ssh_exec_sudo "rm -f /etc/flightctl/flightctl-api/config.yaml"
-    ssh_exec_sudo "systemctl unmask flightctl-api-init.service 2>/dev/null" || true
-    ssh_exec_sudo "systemctl restart flightctl-api-init.service 2>/dev/null" || true
-    sleep 2
-    ssh_exec_sudo "systemctl mask flightctl-api-init.service 2>/dev/null" || true
     ssh_exec_sudo "systemctl restart flightctl-api.service"
     sleep 5
     
