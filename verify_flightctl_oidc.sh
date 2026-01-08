@@ -366,10 +366,41 @@ configure_pam_issuer() {
     
     log_success "PAM Issuer service is running"
     
-    # Note: In FlightCtl rc3+, PAM Issuer starts automatically with flightctl.target
-    # and the default service-config.yaml is already configured to use it
+    # Get the VM hostname - used for auto-detection of issuer URL
+    local vm_hostname=$(ssh_exec "hostname -f" | tr -d '[:space:]')
+    if [ -z "$vm_hostname" ] || [ "$vm_hostname" = "localhost" ]; then
+        log_warning "VM has no valid hostname, PAM issuer auto-detection may fail"
+        log_info "Consider setting hostname with: hostnamectl set-hostname <name>.local"
+    else
+        log_info "VM Hostname: ${vm_hostname}"
+        # Ensure hostname resolves to the VM IP (add to /etc/hosts if needed)
+        log_info "Ensuring hostname ${vm_hostname} resolves to ${VM_IP}..."
+        ssh_exec "grep -q '${vm_hostname}' /etc/hosts || echo '${VM_IP} ${vm_hostname}' | sudo tee -a /etc/hosts > /dev/null"
+    fi
     
-    log_success "PAM Issuer configured successfully"
+    # PAM Issuer URL will be auto-detected from hostname
+    log_info "PAM Issuer URL will be auto-detected as: https://${vm_hostname}:8444/api/v1/auth"
+    
+    # Set auth type to oidc (issuer is auto-detected from hostname)
+    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml" || true
+    
+    # Clear external Keycloak OIDC authority (use PAM instead)
+    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"\"|' /etc/flightctl/service-config.yaml" || true
+    
+    # Regenerate API config (issuer will be auto-configured from hostname)
+    log_info "Regenerating API config..."
+    ssh_exec_sudo "rm -f /etc/flightctl/flightctl-api/config.yaml"
+    ssh_exec_sudo "systemctl unmask flightctl-api-init.service 2>/dev/null" || true
+    ssh_exec_sudo "systemctl restart flightctl-api-init.service 2>/dev/null" || true
+    sleep 2
+    ssh_exec_sudo "systemctl mask flightctl-api-init.service 2>/dev/null" || true
+    
+    # Restart API to pick up new config
+    log_info "Restarting API service..."
+    ssh_exec_sudo "systemctl restart flightctl-api.service"
+    sleep 5
+    
+    log_success "PAM Issuer configured successfully (issuer auto-detected)"
 }
 
 create_pam_user() {
@@ -552,8 +583,12 @@ test_pam_authentication() {
     
     log_info "Testing PAM Issuer authentication with user: ${username}..."
     
-    # Check if PAM Issuer is accessible
-    local pam_issuer_url="https://${VM_IP}:8444/api/v1/auth"
+    # Check if PAM Issuer is accessible - use hostname to match API config
+    local vm_hostname=$(ssh_exec "hostname -f" | tr -d '[:space:]')
+    if [ -z "$vm_hostname" ] || [ "$vm_hostname" = "localhost" ]; then
+        vm_hostname="${VM_IP}"
+    fi
+    local pam_issuer_url="https://${vm_hostname}:8444/api/v1/auth"
     log_info "PAM Issuer URL: ${pam_issuer_url}"
     
     # Test OIDC discovery endpoint
@@ -608,12 +643,17 @@ switch_to_keycloak() {
     log_info "Switching API to Keycloak OIDC..."
     
     local oidc_authority="http://${VM_IP}:8080/realms/${OIDC_REALM}"
+    log_info "Keycloak OIDC Authority: ${oidc_authority}"
     
-    # Update service config to use Keycloak OIDC
-    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml" || true
-    ssh_exec_sudo "sed -i 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml" || true
-    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml" || true
-    ssh_exec_sudo "sed -i 's|oidcClientId:.*|oidcClientId: \"${OIDC_CLIENT_ID}\"|' /etc/flightctl/service-config.yaml" || true
+    # Directly update the API config file to use Keycloak as OIDC issuer
+    # The api-init service regenerates config from hostname, so we modify the final config directly
+    log_info "Updating API config to use Keycloak issuer..."
+    ssh_exec_sudo "sed -i 's|issuer:.*|issuer: ${oidc_authority}|' /etc/flightctl/flightctl-api/config.yaml" || true
+    ssh_exec_sudo "sed -i 's|clientId:.*|clientId: ${OIDC_CLIENT_ID}|' /etc/flightctl/flightctl-api/config.yaml" || true
+    
+    # Show the updated config
+    log_info "Updated OIDC config:"
+    ssh_exec "grep -A5 'oidc:' /etc/flightctl/flightctl-api/config.yaml" || true
     
     # Restart API to pick up new config
     log_info "Restarting API service..."
@@ -627,17 +667,24 @@ switch_to_keycloak() {
 switch_to_pam() {
     log_info "Switching API back to PAM Issuer..."
     
-    local pam_authority="https://${VM_IP}:8444/api/v1/auth"
+    # Update service config - set type to oidc (issuer auto-detected from hostname)
+    ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml" || true
+    ssh_exec_sudo "sed -i 's/type: aap/type: oidc/' /etc/flightctl/service-config.yaml" || true
     
-    # Update service config to use PAM (type: none uses built-in PAM issuer)
-    ssh_exec_sudo "sed -i 's/type: oidc/type: none/' /etc/flightctl/service-config.yaml" || true
+    # Clear any Keycloak OIDC config (use PAM instead)
+    ssh_exec_sudo "sed -i 's|externalOidcAuthority:.*|externalOidcAuthority: \"\"|' /etc/flightctl/service-config.yaml" || true
     
-    # Restart API to pick up new config
-    log_info "Restarting API service..."
+    # Regenerate API config and restart (issuer will be auto-configured from hostname)
+    log_info "Regenerating API config and restarting..."
+    ssh_exec_sudo "rm -f /etc/flightctl/flightctl-api/config.yaml"
+    ssh_exec_sudo "systemctl unmask flightctl-api-init.service 2>/dev/null" || true
+    ssh_exec_sudo "systemctl restart flightctl-api-init.service 2>/dev/null" || true
+    sleep 2
+    ssh_exec_sudo "systemctl mask flightctl-api-init.service 2>/dev/null" || true
     ssh_exec_sudo "systemctl restart flightctl-api.service"
     sleep 5
     
-    log_success "API switched back to PAM Issuer"
+    log_success "API switched back to PAM Issuer (issuer auto-detected)"
 }
 
 configure_auth() {
@@ -1223,7 +1270,10 @@ remove_old_packages() {
     
     if ssh_exec "rpm -qa | grep -q flightctl"; then
         log_info "Removing old packages..."
-        ssh_exec_sudo "dnf remove -y flightctl-services flightctl-cli flightctl flightctl-telemetry-gateway flightctl-observability" || true
+        # Remove ALL flightctl packages to avoid conflicts between Brew and Copr versions
+        ssh_exec_sudo "dnf remove -y 'flightctl*' 2>/dev/null" || true
+        # Double-check specific packages that might conflict
+        ssh_exec_sudo "rpm -e --nodeps flightctl flightctl-cli flightctl-services 2>/dev/null" || true
         log_success "Old packages removed"
     else
         log_info "No old packages to remove"
@@ -1254,6 +1304,12 @@ install_rpms() {
 }
 
 check_container_images() {
+    # Check if image verification should be skipped
+    if [ "${SKIP_IMAGE_CHECK:-false}" = "true" ]; then
+        log_info "Skipping container image tag verification (SKIP_IMAGE_CHECK=true)"
+        return 0
+    fi
+    
     log_info "Checking container images..."
     
     # Get the version from installed RPM
@@ -1397,7 +1453,7 @@ configure_keycloak_realm() {
         }'" >/dev/null 2>&1 || true
     log_success "Realm '${OIDC_REALM}' configured"
     
-    # Create client
+    # Create client (PKCE disabled - FlightCtl CLI doesn't support PKCE yet)
     log_info "Creating client '${OIDC_CLIENT_ID}'..."
     ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/clients' \
         -H 'Authorization: Bearer ${admin_token}' \
@@ -1406,16 +1462,109 @@ configure_keycloak_realm() {
             \"clientId\": \"${OIDC_CLIENT_ID}\",
             \"enabled\": true,
             \"publicClient\": true,
-            \"redirectUris\": [\"https://${VM_IP}:443/callback\", \"http://127.0.0.1/*\"],
-            \"webOrigins\": [\"http://127.0.0.1\", \"https://${VM_IP}:443\"],
+            \"redirectUris\": [\"https://${VM_IP}:443/callback\", \"http://127.0.0.1/*\", \"http://localhost/*\"],
+            \"webOrigins\": [\"http://127.0.0.1\", \"https://${VM_IP}:443\", \"http://localhost\"],
             \"directAccessGrantsEnabled\": true,
             \"standardFlowEnabled\": true,
-            \"protocol\": \"openid-connect\"
+            \"protocol\": \"openid-connect\",
+            \"attributes\": {}
         }'" >/dev/null 2>&1 || true
-    log_success "Client '${OIDC_CLIENT_ID}' configured"
+    log_success "Client '${OIDC_CLIENT_ID}' configured (PKCE optional)"
     
-    # Create test user
-    log_info "Creating test user '${TEST_USER}'..."
+    # Get client internal ID for adding protocol mappers
+    local client_internal_id=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/clients?clientId=${OIDC_CLIENT_ID}' \
+        -H 'Authorization: Bearer ${admin_token}' | jq -r '.[0].id'" 2>/dev/null)
+    
+    if [ -n "$client_internal_id" ] && [ "$client_internal_id" != "null" ]; then
+        # Add 'organizations' protocol mapper to include organizations claim in tokens
+        log_info "Adding 'organizations' claim mapper to client..."
+        ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/clients/${client_internal_id}/protocol-mappers/models' \
+            -H 'Authorization: Bearer ${admin_token}' \
+            -H 'Content-Type: application/json' \
+            -d '{
+                \"name\": \"organizations\",
+                \"protocol\": \"openid-connect\",
+                \"protocolMapper\": \"oidc-usermodel-attribute-mapper\",
+                \"config\": {
+                    \"claim.name\": \"organizations\",
+                    \"user.attribute\": \"organizations\",
+                    \"id.token.claim\": \"true\",
+                    \"access.token.claim\": \"true\",
+                    \"userinfo.token.claim\": \"true\",
+                    \"multivalued\": \"true\",
+                    \"aggregate.attrs\": \"false\"
+                }
+            }'" >/dev/null 2>&1 || true
+        
+        # Add 'roles' protocol mapper to include roles claim in tokens
+        log_info "Adding 'roles' claim mapper to client..."
+        ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/clients/${client_internal_id}/protocol-mappers/models' \
+            -H 'Authorization: Bearer ${admin_token}' \
+            -H 'Content-Type: application/json' \
+            -d '{
+                \"name\": \"flightctl-roles\",
+                \"protocol\": \"openid-connect\",
+                \"protocolMapper\": \"oidc-usermodel-attribute-mapper\",
+                \"config\": {
+                    \"claim.name\": \"roles\",
+                    \"user.attribute\": \"roles\",
+                    \"id.token.claim\": \"true\",
+                    \"access.token.claim\": \"true\",
+                    \"userinfo.token.claim\": \"true\",
+                    \"multivalued\": \"true\",
+                    \"aggregate.attrs\": \"false\"
+                }
+            }'" >/dev/null 2>&1 || true
+        log_success "Protocol mappers for 'organizations' and 'roles' claims added"
+    else
+        log_warning "Could not get client ID for adding protocol mappers"
+    fi
+    
+    # Keycloak 26.x requires User Profile configuration before custom attributes can be set
+    log_info "Configuring User Profile for custom attributes (Keycloak 26.x+)..."
+    
+    # Get current User Profile config
+    local user_profile=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users/profile' \
+        -H 'Authorization: Bearer ${admin_token}'" 2>/dev/null)
+    
+    # Check if organizations attribute already exists
+    local has_org_attr=$(echo "$user_profile" | jq -r '.attributes[]? | select(.name=="organizations") | .name' 2>/dev/null)
+    
+    if [ -z "$has_org_attr" ]; then
+        # Add organizations and roles attributes to User Profile
+        log_info "Adding 'organizations' and 'roles' to User Profile..."
+        local updated_profile=$(echo "$user_profile" | jq '.attributes += [
+            {
+                "name": "organizations",
+                "displayName": "Organizations",
+                "validations": {},
+                "permissions": {"view": ["admin", "user"], "edit": ["admin"]},
+                "multivalued": true
+            },
+            {
+                "name": "roles",
+                "displayName": "FlightCtl Roles",
+                "validations": {},
+                "permissions": {"view": ["admin", "user"], "edit": ["admin"]},
+                "multivalued": true
+            }
+        ]' 2>/dev/null)
+        
+        if [ -n "$updated_profile" ] && [ "$updated_profile" != "null" ]; then
+            ssh_exec "curl -s -X PUT 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users/profile' \
+                -H 'Authorization: Bearer ${admin_token}' \
+                -H 'Content-Type: application/json' \
+                -d '${updated_profile}'" >/dev/null 2>&1 || true
+            log_success "User Profile updated with custom attributes"
+        else
+            log_warning "Could not update User Profile - attributes may not work"
+        fi
+    else
+        log_info "User Profile already has custom attributes configured"
+    fi
+    
+    # Create test user - Step 1: Create user with all required fields
+    log_info "Creating test user '${TEST_USER}' (Step 1: user creation)..."
     ssh_exec "curl -s -X POST 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users' \
         -H 'Authorization: Bearer ${admin_token}' \
         -H 'Content-Type: application/json' \
@@ -1425,24 +1574,68 @@ configure_keycloak_realm() {
             \"email\": \"${TEST_EMAIL}\",
             \"firstName\": \"Test\",
             \"lastName\": \"User\",
-            \"emailVerified\": true
+            \"emailVerified\": true,
+            \"requiredActions\": []
         }'" >/dev/null 2>&1 || true
     
-    # Set password for test user
+    # Get user ID
     local user_id=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users?username=${TEST_USER}' \
         -H 'Authorization: Bearer ${admin_token}' | jq -r '.[0].id'" 2>/dev/null)
     
     if [ -n "$user_id" ] && [ "$user_id" != "null" ]; then
+        # Step 2: Set password
+        log_info "Setting password for '${TEST_USER}' (Step 2)..."
         ssh_exec "curl -s -X PUT 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users/${user_id}/reset-password' \
             -H 'Authorization: Bearer ${admin_token}' \
             -H 'Content-Type: application/json' \
-            -d '{\"type\":\"password\",\"value\":\"${TEST_PASSWORD}\",\"temporary\":false}'" >/dev/null 2>&1
-        log_success "Test user '${TEST_USER}' configured with password"
+            -d '{
+                \"type\": \"password\",
+                \"value\": \"${TEST_PASSWORD}\",
+                \"temporary\": false
+            }'" >/dev/null 2>&1 || true
+        
+        # Step 3: Update user with all required fields AND custom attributes
+        log_info "Setting FlightCtl attributes for '${TEST_USER}' (Step 3)..."
+        ssh_exec "curl -s -X PUT 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users/${user_id}' \
+            -H 'Authorization: Bearer ${admin_token}' \
+            -H 'Content-Type: application/json' \
+            -d '{
+                \"username\": \"${TEST_USER}\",
+                \"enabled\": true,
+                \"email\": \"${TEST_EMAIL}\",
+                \"firstName\": \"Test\",
+                \"lastName\": \"User\",
+                \"emailVerified\": true,
+                \"requiredActions\": [],
+                \"attributes\": {
+                    \"organizations\": [\"default\"],
+                    \"roles\": [\"flightctl-admin\"]
+                }
+            }'" >/dev/null 2>&1 || true
+        
+        # Verify user configuration
+        local user_data=$(ssh_exec "curl -s 'http://localhost:${KEYCLOAK_PORT:-8080}/admin/realms/${OIDC_REALM}/users/${user_id}' \
+            -H 'Authorization: Bearer ${admin_token}'" 2>/dev/null)
+        local user_attrs=$(echo "$user_data" | jq -r '.attributes.organizations[0] // empty' 2>/dev/null)
+        local required_actions=$(echo "$user_data" | jq -r '.requiredActions | length' 2>/dev/null)
+        
+        if [ "$user_attrs" = "default" ]; then
+            log_success "Test user '${TEST_USER}' configured with organizations=['default'] and roles=['flightctl-admin']"
+        else
+            log_warning "User attributes may not have been set correctly (Keycloak version specific)"
+            log_info "You can manually set attributes in Keycloak Admin Console: http://${VM_IP}:8080/admin"
+        fi
+        
+        if [ "$required_actions" = "0" ] || [ -z "$required_actions" ]; then
+            log_success "No required actions pending for user"
+        else
+            log_warning "User has ${required_actions} required action(s) - may cause login issues"
+        fi
     else
-        log_warning "Could not set password for test user"
+        log_warning "Could not create or find test user"
     fi
     
-    log_success "Keycloak realm and client configured"
+    log_success "Keycloak realm and client configured with FlightCtl claim mappings"
 }
 
 configure_oidc() {
@@ -1463,8 +1656,8 @@ configure_oidc() {
     log_info "  - Setting auth type to oidc..."
     ssh_exec_sudo "sed -i 's/type: none/type: oidc/' /etc/flightctl/service-config.yaml" || log_warning "Failed to set type"
     
-    log_info "  - Setting baseDomain to ${VM_IP}..."
-    ssh_exec_sudo "sed -i 's|baseDomain:.*|baseDomain: ${VM_IP}|' /etc/flightctl/service-config.yaml" || log_warning "Failed to set baseDomain"
+    # Note: Do NOT set baseDomain to IP address - Brew builds require FQDN
+    # Leave baseDomain empty to use default (hostname -f)
     
     log_info "  - Setting oidcAuthority..."
     ssh_exec_sudo "sed -i 's|oidcAuthority:.*|oidcAuthority: \"${oidc_authority}\"|' /etc/flightctl/service-config.yaml" || log_warning "Failed to set oidcAuthority"
@@ -1730,9 +1923,29 @@ test_oidc_authentication() {
         log_success "Keycloak authentication successful for user: ${TEST_USER}"
         
         # Extract and display token info
-        local access_token=$(echo "$token_response" | grep -o '"access_token":"[^"]*"' | cut -d'"' -f4)
-        if [ -n "$access_token" ]; then
+        local access_token=$(echo "$token_response" | jq -r '.access_token' 2>/dev/null)
+        if [ -n "$access_token" ] && [ "$access_token" != "null" ]; then
             log_info "Access token obtained (first 50 chars): ${access_token:0:50}..."
+            
+            # Decode JWT payload and check for FlightCtl claims (organizations, roles)
+            log_info "Verifying FlightCtl claims in token..."
+            local token_payload=$(echo "$access_token" | cut -d'.' -f2 | tr '_-' '/+' | base64 -d 2>/dev/null)
+            
+            local orgs_claim=$(echo "$token_payload" | jq -r '.organizations // empty' 2>/dev/null)
+            local roles_claim=$(echo "$token_payload" | jq -r '.roles // empty' 2>/dev/null)
+            
+            if [ -n "$orgs_claim" ] && [ "$orgs_claim" != "null" ]; then
+                log_success "Token contains 'organizations' claim: ${orgs_claim}"
+            else
+                log_warning "Token is missing 'organizations' claim - FlightCtl login may fail"
+                log_info "Ensure Keycloak user has 'organizations' attribute and client has protocol mapper"
+            fi
+            
+            if [ -n "$roles_claim" ] && [ "$roles_claim" != "null" ]; then
+                log_success "Token contains 'roles' claim: ${roles_claim}"
+            else
+                log_warning "Token is missing 'roles' claim - user may have limited permissions"
+            fi
         fi
     else
         log_warning "Keycloak authentication failed for user: ${TEST_USER}"
@@ -1746,9 +1959,14 @@ test_oidc_authentication() {
         insecure_flag="-k"
     fi
     
+    # Check available providers first
+    log_info "Available auth providers:"
+    ssh_exec "flightctl login https://${VM_IP}:3443 ${insecure_flag} --show-providers 2>&1" || true
+    
+    # Use standard password flow (rc5+ doesn't use --client-id)
     local login_result=$(ssh_exec "flightctl login https://${VM_IP}:3443 ${insecure_flag} \
-        --username ${TEST_USER} \
-        --password ${TEST_PASSWORD} 2>&1" || echo "")
+        -u ${TEST_USER} \
+        -p ${TEST_PASSWORD} 2>&1" || echo "")
     
     if echo "$login_result" | grep -q "Login successful"; then
         log_success "FlightCtl CLI login successful for user: ${TEST_USER}"

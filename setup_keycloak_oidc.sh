@@ -182,7 +182,7 @@ else
     log_error "Failed to create realm (HTTP ${REALM_CREATE_RESULT})"
 fi
 
-# Step 5: Create client
+# Step 5: Create client (PKCE disabled - FlightCtl CLI doesn't support PKCE yet)
 log_info "Creating client '${CLIENT_ID}'..."
 CLIENT_CREATE_RESULT=$(ssh_exec "curl -s -w '%{http_code}' -o /dev/null -X POST 'http://localhost:${KEYCLOAK_PORT}/admin/realms/${REALM_NAME}/clients' \
   -H 'Authorization: Bearer ${ADMIN_TOKEN}' \
@@ -193,16 +193,19 @@ CLIENT_CREATE_RESULT=$(ssh_exec "curl -s -w '%{http_code}' -o /dev/null -X POST 
     \"publicClient\": true,
     \"redirectUris\": [
       \"https://${VM_IP}:443/callback\",
-      \"http://127.0.0.1/*\"
+      \"http://127.0.0.1/*\",
+      \"http://localhost/*\"
     ],
     \"webOrigins\": [
       \"http://127.0.0.1\",
-      \"https://${VM_IP}:443\"
+      \"https://${VM_IP}:443\",
+      \"http://localhost\"
     ],
     \"directAccessGrantsEnabled\": true,
     \"standardFlowEnabled\": true,
     \"implicitFlowEnabled\": false,
-    \"protocol\": \"openid-connect\"
+    \"protocol\": \"openid-connect\",
+    \"attributes\": {}
   }'")
 
 if [ "$CLIENT_CREATE_RESULT" = "201" ] || [ "$CLIENT_CREATE_RESULT" = "409" ]; then
