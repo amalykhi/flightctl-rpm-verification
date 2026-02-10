@@ -2617,10 +2617,11 @@ approve_enrollment() {
     log_info "Approving enrollment request: ${enrollment_name}..."
     
     # Build approve command with optional labels
-    local approve_cmd="flightctl approve ${enrollment_name}"
+    local approve_cmd="flightctl approve enrollmentrequest ${enrollment_name}"
     
     if [ -n "${DEVICE_LABELS}" ]; then
-        approve_cmd="${approve_cmd} --labels '${DEVICE_LABELS}'"
+        # Use -l flag for labels (comma-separated key=value pairs)
+        approve_cmd="${approve_cmd} -l '${DEVICE_LABELS}'"
     fi
     
     ssh_exec "${approve_cmd}"
