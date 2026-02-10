@@ -1632,7 +1632,7 @@ configure_keycloak_realm() {
         
         if [ "$user_attrs" = "default" ]; then
             log_success "Test user '${TEST_USER}' configured with organizations=['default'] and roles=['flightctl-admin']"
-        else
+    else
             log_warning "User attributes may not have been set correctly (Keycloak version specific)"
             log_info "You can manually set attributes in Keycloak Admin Console: http://${VM_IP}:8080/admin"
         fi
@@ -2227,6 +2227,560 @@ EOF
 }
 
 ################################################################################
+# Device Onboarding Functions
+################################################################################
+
+# Agent VM IP (will be set after VM is created/started)
+AGENT_VM_IP=""
+
+# SSH helper for agent VM
+agent_ssh_exec() {
+    sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${AGENT_VM_USER}@${AGENT_VM_IP}" "$@"
+}
+
+agent_ssh_exec_sudo() {
+    sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${AGENT_VM_USER}@${AGENT_VM_IP}" "echo '${AGENT_VM_PASSWORD}' | sudo -S $*"
+}
+
+agent_scp() {
+    sshpass -p "${AGENT_VM_PASSWORD}" scp -o StrictHostKeyChecking=no "$@"
+}
+
+# Get agent VM IP from libvirt
+get_agent_vm_ip() {
+    log_info "Getting agent VM IP address..."
+    
+    local max_attempts=30
+    local attempt=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        AGENT_VM_IP=$(sudo virsh domifaddr "${AGENT_VM_NAME}" 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+        
+        if [ -n "$AGENT_VM_IP" ]; then
+            log_success "Agent VM IP: ${AGENT_VM_IP}"
+            return 0
+        fi
+        
+        log_info "Waiting for agent VM IP (attempt ${attempt}/${max_attempts})..."
+        sleep 5
+        ((attempt++))
+    done
+    
+    log_error "Failed to get agent VM IP after ${max_attempts} attempts"
+    return 1
+}
+
+# Check if agent VM exists
+agent_vm_exists() {
+    virsh dominfo "${AGENT_VM_NAME}" &>/dev/null
+}
+
+# Check if agent VM is running
+agent_vm_running() {
+    local state=$(virsh domstate "${AGENT_VM_NAME}" 2>/dev/null)
+    [ "$state" = "running" ]
+}
+
+# Create agent VM using cloud-init
+create_agent_vm() {
+    log_info "Creating agent VM: ${AGENT_VM_NAME}..."
+    
+    local image_url=""
+    local os_variant="rocky9"
+    
+    case "${AGENT_VM_IMAGE:-rocky9}" in
+        "rocky9"|"ROCKY9")
+            image_url="https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
+            os_variant="rocky9"
+            ;;
+        "centos9"|"CENTOS9")
+            image_url="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+            os_variant="centos-stream9"
+            ;;
+        http*|https*)
+            image_url="${AGENT_VM_IMAGE}"
+            os_variant="rocky9"
+            ;;
+        *)
+            log_error "Unknown agent VM image: ${AGENT_VM_IMAGE}"
+            return 1
+            ;;
+    esac
+    
+    local disk_path="/var/lib/libvirt/images/${AGENT_VM_NAME}.qcow2"
+    local cloud_init_dir="${WORK_DIR}/agent-cloud-init"
+    
+    mkdir -p "${cloud_init_dir}"
+    
+    # Create cloud-init user-data
+    cat > "${cloud_init_dir}/user-data" << EOF
+#cloud-config
+users:
+  - name: ${AGENT_VM_USER}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: "${AGENT_VM_PASSWORD}"
+    ssh_authorized_keys: []
+
+chpasswd:
+  expire: false
+
+ssh_pwauth: true
+
+packages:
+  - curl
+  - wget
+  - vim
+
+runcmd:
+  - systemctl enable --now sshd
+  - echo "${AGENT_VM_USER}:${AGENT_VM_PASSWORD}" | chpasswd
+EOF
+    
+    # Create cloud-init meta-data
+    cat > "${cloud_init_dir}/meta-data" << EOF
+instance-id: ${AGENT_VM_NAME}
+local-hostname: ${AGENT_VM_NAME}
+EOF
+    
+    # Download base image if not cached
+    local cache_dir="/var/lib/libvirt/images/cache"
+    local cached_image="${cache_dir}/$(basename ${image_url})"
+    
+    sudo mkdir -p "${cache_dir}"
+    
+    if [ ! -f "${cached_image}" ]; then
+        log_info "Downloading base image..."
+        sudo curl -L -o "${cached_image}" "${image_url}"
+    else
+        log_info "Using cached base image: ${cached_image}"
+    fi
+    
+    # Create disk from base image
+    log_info "Creating VM disk..."
+    sudo cp "${cached_image}" "${disk_path}"
+    sudo qemu-img resize "${disk_path}" "${AGENT_VM_DISK_SIZE:-20}G"
+    
+    # Create cloud-init ISO
+    log_info "Creating cloud-init ISO..."
+    local cloud_init_iso="${cloud_init_dir}/cloud-init.iso"
+    genisoimage -output "${cloud_init_iso}" -volid cidata -joliet -rock \
+        "${cloud_init_dir}/user-data" "${cloud_init_dir}/meta-data" 2>/dev/null || \
+    mkisofs -output "${cloud_init_iso}" -volid cidata -joliet -rock \
+        "${cloud_init_dir}/user-data" "${cloud_init_dir}/meta-data"
+    
+    # Create VM
+    log_info "Creating VM with virt-install..."
+    sudo virt-install \
+        --name "${AGENT_VM_NAME}" \
+        --memory "${AGENT_VM_MEMORY:-2048}" \
+        --vcpus "${AGENT_VM_CPUS:-2}" \
+        --disk "path=${disk_path},format=qcow2" \
+        --disk "path=${cloud_init_iso},device=cdrom" \
+        --os-variant "${os_variant}" \
+        --network network=default \
+        --import \
+        --graphics none \
+        --noautoconsole \
+        --wait 0
+    
+    log_success "Agent VM created: ${AGENT_VM_NAME}"
+    
+    # Wait for VM to boot and get IP
+    log_info "Waiting for agent VM to boot..."
+    sleep 30
+    get_agent_vm_ip
+    
+    # Wait for SSH to be available
+    log_info "Waiting for SSH to be available..."
+    local ssh_attempts=0
+    local max_ssh_attempts=30
+    
+    while [ $ssh_attempts -lt $max_ssh_attempts ]; do
+        if agent_ssh_exec "echo 'SSH ready'" &>/dev/null; then
+            log_success "SSH is available on agent VM"
+            return 0
+        fi
+        sleep 5
+        ((ssh_attempts++))
+        log_info "Waiting for SSH (attempt ${ssh_attempts}/${max_ssh_attempts})..."
+    done
+    
+    log_error "SSH not available after ${max_ssh_attempts} attempts"
+    return 1
+}
+
+# Start existing agent VM
+start_agent_vm() {
+    log_info "Starting agent VM: ${AGENT_VM_NAME}..."
+    
+    if agent_vm_running; then
+        log_info "Agent VM is already running"
+    else
+        virsh start "${AGENT_VM_NAME}"
+        sleep 10
+    fi
+    
+    get_agent_vm_ip
+}
+
+# Stop and remove agent VM
+cleanup_agent_vm() {
+    log_info "Cleaning up agent VM: ${AGENT_VM_NAME}..."
+    
+    virsh destroy "${AGENT_VM_NAME}" 2>/dev/null || true
+    virsh undefine "${AGENT_VM_NAME}" --remove-all-storage 2>/dev/null || true
+    
+    log_success "Agent VM cleaned up"
+}
+
+# Generate enrollment config and save to file
+generate_enrollment_config() {
+    log_info "Generating enrollment configuration with client certificate..."
+    
+    local enrollment_config="${WORK_DIR}/enrollment-config.yaml"
+    
+    # Ensure CLI is logged in before generating enrollment config
+    local insecure_flag=""
+    if [ "${INSECURE_SKIP_TLS_VERIFY:-false}" = "true" ]; then
+        insecure_flag="-k"
+    fi
+    
+    log_info "Logging in to FlightCtl API..."
+    ssh_exec "flightctl login https://${VM_IP}:3443 ${insecure_flag} -u ${PAM_USER:-admin} -p ${PAM_PASSWORD:-admin123}" > /dev/null 2>&1
+    
+    # Generate enrollment config with client certificate using certificate request
+    # This creates a CSR, submits it, and returns config with embedded client cert/key
+    # Required for mTLS enrollment on port 7443
+    log_info "Requesting client certificate for enrollment..."
+    ssh_exec "flightctl certificate request --expiration=365d -o embedded 2>/dev/null" > "${enrollment_config}"
+    
+    if [ ! -s "${enrollment_config}" ]; then
+        log_error "Failed to generate enrollment config with certificate"
+        return 1
+    fi
+    
+    # Verify the config has client certificate data
+    if grep -q 'client-certificate-data: ""' "${enrollment_config}" 2>/dev/null; then
+        log_error "Enrollment config has empty client certificate - mTLS will fail"
+        return 1
+    fi
+    
+    log_success "Enrollment config with client certificate saved to: ${enrollment_config}"
+    return 0
+}
+
+# Install flightctl-agent on agent VM
+install_agent_on_vm() {
+    log_info "Installing flightctl-agent on agent VM..."
+    
+    # Get list of available RPMs from the source
+    log_info "Looking for agent RPMs in ${RPM_BASE_URL}..."
+    local rpm_list=$(curl -sL "${RPM_BASE_URL}" | grep -oE "href=['\"][^'\"]*\.rpm['\"]" | sed "s/href=['\"]//;s/['\"]$//" | sort -u)
+    
+    # Find agent RPM
+    local agent_rpm=$(echo "$rpm_list" | grep -E "flightctl-agent.*x86_64\.rpm" | head -1)
+    if [ -z "$agent_rpm" ]; then
+        log_error "Could not find flightctl-agent RPM in ${RPM_BASE_URL}"
+        return 1
+    fi
+    
+    # Find selinux RPM (required dependency)
+    local selinux_rpm=$(echo "$rpm_list" | grep -E "flightctl-selinux.*\.rpm" | head -1)
+    if [ -z "$selinux_rpm" ]; then
+        log_warning "Could not find flightctl-selinux RPM - will try to install without it"
+    fi
+    
+    # Download and copy agent RPM
+    local agent_rpm_url="${RPM_BASE_URL}${agent_rpm}"
+    local local_agent_rpm="${WORK_DIR}/${agent_rpm}"
+    
+    if [ ! -f "${local_agent_rpm}" ]; then
+        log_info "Downloading ${agent_rpm}..."
+        curl -sL -o "${local_agent_rpm}" "${agent_rpm_url}"
+    fi
+    
+    log_info "Copying agent RPM to agent VM..."
+    agent_scp "${local_agent_rpm}" "${AGENT_VM_USER}@${AGENT_VM_IP}:/tmp/"
+    
+    # Download and copy selinux RPM if found
+    if [ -n "$selinux_rpm" ]; then
+        local selinux_rpm_url="${RPM_BASE_URL}${selinux_rpm}"
+        local local_selinux_rpm="${WORK_DIR}/${selinux_rpm}"
+        
+        if [ ! -f "${local_selinux_rpm}" ]; then
+            log_info "Downloading ${selinux_rpm}..."
+            curl -sL -o "${local_selinux_rpm}" "${selinux_rpm_url}"
+        fi
+        
+        log_info "Copying selinux RPM to agent VM..."
+        agent_scp "${local_selinux_rpm}" "${AGENT_VM_USER}@${AGENT_VM_IP}:/tmp/"
+    fi
+    
+    # Install RPMs on agent VM
+    log_info "Installing agent RPMs..."
+    if [ -n "$selinux_rpm" ]; then
+        agent_ssh_exec_sudo "dnf install -y /tmp/${selinux_rpm} /tmp/${agent_rpm}"
+    else
+        agent_ssh_exec_sudo "dnf install -y /tmp/${agent_rpm}"
+    fi
+    
+    log_success "flightctl-agent installed on agent VM"
+    return 0
+}
+
+# Configure agent with enrollment config
+configure_agent() {
+    log_info "Configuring flightctl-agent..."
+    
+    local enrollment_config="${WORK_DIR}/enrollment-config.yaml"
+    
+    if [ ! -f "${enrollment_config}" ]; then
+        log_error "Enrollment config not found: ${enrollment_config}"
+        return 1
+    fi
+    
+    # Copy enrollment config to agent VM
+    log_info "Copying enrollment config to agent VM..."
+    agent_scp "${enrollment_config}" "${AGENT_VM_USER}@${AGENT_VM_IP}:/tmp/config.yaml"
+    
+    # Create flightctl config directory and copy config
+    agent_ssh_exec_sudo "mkdir -p /etc/flightctl"
+    agent_ssh_exec_sudo "cp /tmp/config.yaml /etc/flightctl/config.yaml"
+    agent_ssh_exec_sudo "chmod 644 /etc/flightctl/config.yaml"
+    
+    log_success "Agent configured with enrollment config"
+    return 0
+}
+
+# Start agent service
+start_agent_service() {
+    log_info "Starting flightctl-agent service..."
+    
+    agent_ssh_exec_sudo "systemctl enable flightctl-agent"
+    agent_ssh_exec_sudo "systemctl start flightctl-agent"
+    
+    sleep 5
+    
+    local status=$(agent_ssh_exec_sudo "systemctl is-active flightctl-agent" 2>/dev/null || echo "unknown")
+    
+    if [ "$status" = "active" ]; then
+        log_success "flightctl-agent service is running"
+        return 0
+    else
+        log_error "flightctl-agent service failed to start"
+        agent_ssh_exec_sudo "journalctl -u flightctl-agent --no-pager -n 50" || true
+        return 1
+    fi
+}
+
+# Wait for enrollment request to appear
+wait_for_enrollment_request() {
+    echo -e "${BLUE}[INFO]${NC} Waiting for enrollment request..." >&2
+    
+    local max_attempts=30
+    local attempt=1
+    local enrollment_name=""
+    
+    while [ $attempt -le $max_attempts ]; do
+        # Get enrollment requests
+        local enrollments=$(ssh_exec "flightctl get enrollmentrequests -o json 2>/dev/null" || echo "{}")
+        
+        # Check if there's a pending enrollment
+        enrollment_name=$(echo "$enrollments" | jq -r '.items[]? | select(.status.approval.approved != true) | .metadata.name' 2>/dev/null | head -1)
+        
+        if [ -n "$enrollment_name" ] && [ "$enrollment_name" != "null" ]; then
+            echo -e "${GREEN}[SUCCESS]${NC} Found enrollment request: ${enrollment_name}" >&2
+            echo "$enrollment_name"
+            return 0
+        fi
+        
+        echo -e "${BLUE}[INFO]${NC} Waiting for enrollment request (attempt ${attempt}/${max_attempts})..." >&2
+        sleep 5
+        ((attempt++))
+    done
+    
+    echo -e "${RED}[ERROR]${NC} No enrollment request found after ${max_attempts} attempts" >&2
+    return 1
+}
+
+# Approve enrollment request
+approve_enrollment() {
+    local enrollment_name="$1"
+    
+    if [ -z "$enrollment_name" ]; then
+        log_error "No enrollment name provided"
+        return 1
+    fi
+    
+    log_info "Approving enrollment request: ${enrollment_name}..."
+    
+    # Build approve command with optional labels
+    local approve_cmd="flightctl approve ${enrollment_name}"
+    
+    if [ -n "${DEVICE_LABELS}" ]; then
+        approve_cmd="${approve_cmd} --labels '${DEVICE_LABELS}'"
+    fi
+    
+    ssh_exec "${approve_cmd}"
+    
+    if [ $? -eq 0 ]; then
+        log_success "Enrollment request approved: ${enrollment_name}"
+        return 0
+    else
+        log_error "Failed to approve enrollment request"
+        return 1
+    fi
+}
+
+# Wait for device to appear and be ready
+wait_for_device() {
+    local enrollment_name="$1"
+    
+    log_info "Waiting for device to be enrolled..."
+    
+    local max_attempts=30
+    local attempt=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        # Check if device exists
+        local devices=$(ssh_exec "flightctl get devices -o json 2>/dev/null" || echo "{}")
+        local device_count=$(echo "$devices" | jq '.items | length' 2>/dev/null || echo "0")
+        
+        if [ "$device_count" -gt 0 ]; then
+            local device_name=$(echo "$devices" | jq -r '.items[0].metadata.name' 2>/dev/null)
+            local device_status=$(echo "$devices" | jq -r '.items[0].status.summary.status' 2>/dev/null || echo "unknown")
+            
+            log_success "Device enrolled: ${device_name} (status: ${device_status})"
+            echo "$device_name"
+            return 0
+        fi
+        
+        log_info "Waiting for device (attempt ${attempt}/${max_attempts})..."
+        sleep 5
+        ((attempt++))
+    done
+    
+    log_error "Device not enrolled after ${max_attempts} attempts"
+    return 1
+}
+
+# Verify device is communicating with server
+verify_device_communication() {
+    local device_name="$1"
+    
+    log_info "Verifying device communication..."
+    
+    # Check device status
+    local device_info=$(ssh_exec "flightctl get device ${device_name} -o json 2>/dev/null" || echo "{}")
+    
+    local last_seen=$(echo "$device_info" | jq -r '.status.lastSeen' 2>/dev/null || echo "unknown")
+    local summary_status=$(echo "$device_info" | jq -r '.status.summary.status' 2>/dev/null || echo "unknown")
+    
+    log_info "Device: ${device_name}"
+    log_info "  Status: ${summary_status}"
+    log_info "  Last Seen: ${last_seen}"
+    
+    # Check agent logs on agent VM
+    log_info "Agent logs (last 10 lines):"
+    agent_ssh_exec_sudo "journalctl -u flightctl-agent --no-pager -n 10" 2>/dev/null || true
+    
+    if [ "$summary_status" != "unknown" ] && [ "$summary_status" != "null" ]; then
+        log_success "Device is communicating with server"
+        return 0
+    else
+        log_warning "Device status unknown - may still be initializing"
+        return 0
+    fi
+}
+
+# Main device onboarding function
+test_device_onboarding() {
+    if [ "${ENABLE_DEVICE_ONBOARDING:-false}" != "true" ]; then
+        log_info "Device onboarding is disabled (ENABLE_DEVICE_ONBOARDING=${ENABLE_DEVICE_ONBOARDING:-false})"
+        return 0
+    fi
+    
+    echo ""
+    log_info "═══════════════════════════════════════════════════════════"
+    log_info "Device Onboarding Test"
+    log_info "═══════════════════════════════════════════════════════════"
+    
+    # Step 1: Create or start agent VM
+    if agent_vm_exists; then
+        log_info "Agent VM exists, starting it..."
+        start_agent_vm
+    else
+        log_info "Creating new agent VM..."
+        create_agent_vm
+    fi
+    
+    if [ -z "$AGENT_VM_IP" ]; then
+        log_error "Failed to get agent VM IP"
+        return 1
+    fi
+    
+    # Step 2: Generate enrollment config
+    generate_enrollment_config
+    
+    # Step 3: Install agent on VM
+    install_agent_on_vm
+    
+    # Step 4: Configure agent
+    configure_agent
+    
+    # Step 5: Start agent service
+    start_agent_service
+    
+    # Step 6: Wait for enrollment request
+    local enrollment_name=$(wait_for_enrollment_request)
+    
+    if [ -z "$enrollment_name" ]; then
+        log_error "No enrollment request received"
+        return 1
+    fi
+    
+    # Step 7: Approve enrollment (if auto mode)
+    if [ "${ENROLLMENT_APPROVAL_MODE:-auto}" = "auto" ]; then
+        approve_enrollment "$enrollment_name"
+    else
+        log_info "Manual approval mode - please approve enrollment request: ${enrollment_name}"
+        log_info "Run: flightctl approve ${enrollment_name}"
+        log_info "Waiting 60 seconds for manual approval..."
+        sleep 60
+    fi
+    
+    # Step 8: Wait for device to be enrolled
+    local device_name=$(wait_for_device "$enrollment_name")
+    
+    if [ -z "$device_name" ]; then
+        log_error "Device enrollment failed"
+        return 1
+    fi
+    
+    # Step 9: Verify device communication
+    verify_device_communication "$device_name"
+    
+    echo ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_success "Device Onboarding Test Complete!"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Agent VM: ${AGENT_VM_NAME} (${AGENT_VM_IP})"
+    log_info "  Device: ${device_name}"
+    log_info ""
+    log_info "  To access agent VM:"
+    log_info "    ssh ${AGENT_VM_USER}@${AGENT_VM_IP}"
+    log_info "    Password: ${AGENT_VM_PASSWORD}"
+    log_info ""
+    log_info "  To view agent logs:"
+    log_info "    ssh ${AGENT_VM_USER}@${AGENT_VM_IP} 'sudo journalctl -u flightctl-agent -f'"
+    echo ""
+    
+    return 0
+}
+
+################################################################################
 # Main Execution
 ################################################################################
 
@@ -2272,6 +2826,9 @@ main() {
     test_ui
     test_api
     test_authentication
+    
+    # Device onboarding test (if enabled)
+    test_device_onboarding
     
     echo ""
     collect_service_logs
@@ -2340,4 +2897,5 @@ main() {
 
 # Run main function
 main "$@"
+
 
