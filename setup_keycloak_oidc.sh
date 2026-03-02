@@ -121,8 +121,8 @@ ssh_exec_sudo "podman run -d --name keycloak \
 # Step 2: Open firewall ports for Keycloak and FlightCtl
 log_info "Configuring firewall ports..."
 if ssh_exec "sudo firewall-cmd --state 2>/dev/null" | grep -q "running"; then
-    log_info "Opening ports: 8080 (Keycloak), 443 (UI), 3443 (API)..."
-    ssh_exec_sudo "firewall-cmd --permanent --add-port=8080/tcp --add-port=443/tcp --add-port=3443/tcp" > /dev/null 2>&1
+    log_info "Opening ports: ${KEYCLOAK_PORT} (Keycloak), 443 (UI), 3443 (API)..."
+    ssh_exec_sudo "firewall-cmd --permanent --add-port=${KEYCLOAK_PORT}/tcp --add-port=443/tcp --add-port=3443/tcp" > /dev/null 2>&1
     ssh_exec_sudo "firewall-cmd --reload" > /dev/null 2>&1
     log_success "Firewall ports opened"
 else
