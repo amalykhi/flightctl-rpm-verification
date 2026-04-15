@@ -40,16 +40,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Load configuration
 CONFIG_FILE="${1:-${SCRIPT_DIR}/verification.conf}"
 
+# CLI overrides (applied after sourcing; sourcing must not clobber these)
+CLI_VM_NAME=""
+CLI_RPM_URL_ARG=""
+
 # Check for legacy command line args (VM_NAME, RPM_URL)
 if [ $# -eq 2 ] && [ ! -f "${1}" ]; then
     # Legacy mode: first arg is VM_NAME, second is RPM_URL
-    VM_NAME="${1}"
-    RPM_URL_ARG="${2}"
+    CLI_VM_NAME="${1}"
+    CLI_RPM_URL_ARG="${2}"
     CONFIG_FILE="${SCRIPT_DIR}/verification.conf"
 elif [ $# -eq 1 ] && [ ! -f "${1}" ]; then
     # Legacy mode: first arg is VM_NAME
-    VM_NAME="${1}"
-    RPM_URL_ARG="LATEST"
+    CLI_VM_NAME="${1}"
+    CLI_RPM_URL_ARG="LATEST"
     CONFIG_FILE="${SCRIPT_DIR}/verification.conf"
 fi
 
@@ -63,9 +67,14 @@ fi
 echo -e "${BLUE}[INFO]${NC} Loading configuration from: ${CONFIG_FILE}"
 source "${CONFIG_FILE}"
 
-# Override from config if not set by command line
-VM_NAME="${VM_NAME:-${VM_NAME}}"
-RPM_URL_ARG="${RPM_URL_ARG:-${RPM_SOURCE:-LATEST}}"
+if [ -n "${CLI_VM_NAME}" ]; then
+    VM_NAME="${CLI_VM_NAME}"
+fi
+if [ -n "${CLI_RPM_URL_ARG}" ]; then
+    RPM_URL_ARG="${CLI_RPM_URL_ARG}"
+else
+    RPM_URL_ARG="${RPM_SOURCE:-LATEST}"
+fi
 
 # Working directory
 WORK_DIR="$(pwd)/flightctl_verification_$(date +%Y%m%d_%H%M%S)"
@@ -195,6 +204,20 @@ enable_fips_mode() {
         log_success "FIPS mode is already enabled"
         verify_fips_mode
         return 0
+    fi
+    
+    # RHEL 10+ removed fips-mode-setup; FIPS must be enabled at install time (fips=1 kernel param)
+    if ! ssh_exec "command -v fips-mode-setup" &>/dev/null && ! ssh_exec_sudo "command -v fips-mode-setup" &>/dev/null; then
+        local os_id=$(ssh_exec "grep -E '^ID=' /etc/os-release 2>/dev/null | head -1" || echo "")
+        local ver_id=$(ssh_exec "grep -E '^VERSION_ID=' /etc/os-release 2>/dev/null | head -1" || echo "")
+        if echo "${os_id} ${ver_id}" | grep -qE 'rhel|el10|"10'; then
+            log_error "FIPS cannot be enabled on this OS: fips-mode-setup is not available (removed in RHEL 10)."
+            log_info "On RHEL 10, FIPS must be enabled during installation (e.g. add fips=1 to kernel cmdline at install)."
+            log_info "To run verification without FIPS, set ENABLE_FIPS=false in verification.conf"
+            return 1
+        fi
+        log_error "fips-mode-setup not found on VM. Install the crypto-policies or fips-mode-setup package, or enable FIPS at OS install time."
+        return 1
     fi
     
     # Enable FIPS mode
@@ -327,6 +350,10 @@ full_cleanup() {
     log_info "Pruning unused container images (this may take a moment)..."
     ssh_exec_sudo "podman image prune -a -f 2>/dev/null" || true
     
+    # Clean up podman builder cache
+    log_info "Pruning podman builder cache..."
+    ssh_exec_sudo "podman builder prune -a -f 2>/dev/null" || true
+    
     # Show disk usage after cleanup
     log_info "Disk usage after cleanup:"
     ssh_exec "df -h / | tail -1" || true
@@ -347,6 +374,36 @@ full_cleanup() {
     
     log_success "Full cleanup completed"
     echo ""
+}
+
+################################################################################
+# VM Hostname (for PAM issuer URL and token validation)
+################################################################################
+
+# Set a proper hostname on the VM so PAM issuer auto-detection uses a reachable URL.
+# Without this, hostname -f is often "localhost" and the API fails to validate tokens.
+ensure_vm_hostname() {
+    log_info "Ensuring VM has a valid hostname for PAM issuer..."
+    local current=$(ssh_exec "hostname -f" | tr -d '[:space:]')
+    if [ -n "$current" ] && [ "$current" != "localhost" ] && [ "$current" != "localhost.localdomain" ]; then
+        log_success "VM hostname is already set: ${current}"
+        ssh_exec "grep -q '${current}' /etc/hosts || echo '${VM_IP} ${current}' | sudo tee -a /etc/hosts > /dev/null"
+        return 0
+    fi
+    # Derive FQDN from VM_NAME (e.g. RHEL10.1 -> rhel10-1.local)
+    local fqdn=$(echo "${VM_NAME}" | tr '[:upper:]' '[:lower:]' | sed 's/\./-/g')
+    [ -z "$fqdn" ] && fqdn="flightctl-vm"
+    fqdn="${fqdn}.local"
+    log_info "Setting VM hostname to ${fqdn} (resolving to ${VM_IP})..."
+    ssh_exec_sudo "hostnamectl set-hostname ${fqdn}"
+    # Resolve hostname to VM IP so API (and containers) can reach PAM issuer on the host
+    ssh_exec "grep -q '${fqdn}' /etc/hosts || echo '${VM_IP} ${fqdn}' | sudo tee -a /etc/hosts > /dev/null"
+    local verify=$(ssh_exec "hostname -f" | tr -d '[:space:]')
+    if [ "$verify" = "$fqdn" ]; then
+        log_success "VM hostname set to ${fqdn}"
+    else
+        log_warning "Hostname set to ${fqdn} but hostname -f reports: ${verify}"
+    fi
 }
 
 ################################################################################
@@ -375,7 +432,10 @@ configure_pam_issuer() {
         log_info "VM Hostname: ${vm_hostname}"
         # Ensure hostname resolves to the VM IP (add to /etc/hosts if needed)
         log_info "Ensuring hostname ${vm_hostname} resolves to ${VM_IP}..."
-        ssh_exec "grep -q '${vm_hostname}' /etc/hosts || echo '${VM_IP} ${vm_hostname}' | sudo tee -a /etc/hosts > /dev/null"
+        # Remove any existing entry for this hostname (may have stale IP)
+        ssh_exec_sudo "sed -i '/${vm_hostname}/d' /etc/hosts"
+        # Add the correct entry
+        ssh_exec "echo '${VM_IP} ${vm_hostname}' | sudo tee -a /etc/hosts > /dev/null"
     fi
     
     # PAM Issuer URL will be auto-detected from hostname
@@ -459,7 +519,7 @@ verify_flightctl_resources() {
     
     # Test 1: Create a Fleet
     log_info "Test 1: Creating test fleet '${test_fleet_name}'..."
-    local fleet_yaml="apiVersion: v1alpha1
+    local fleet_yaml="apiVersion: v1beta1
 kind: Fleet
 metadata:
   name: ${test_fleet_name}
@@ -505,7 +565,7 @@ spec:
     
     # Test 4: Create a Repository
     log_info "Test 4: Creating test repository '${test_repo_name}'..."
-    local repo_yaml="apiVersion: v1alpha1
+    local repo_yaml="apiVersion: v1beta1
 kind: Repository
 metadata:
   name: ${test_repo_name}
@@ -817,8 +877,8 @@ get_brew_task_rpms() {
     # Ensure WORK_DIR exists
     mkdir -p "${WORK_DIR}"
     
-    # Download the task page
-    local task_html=$(curl -s -L "${task_url}" 2>&1)
+    # Download the task page (Brew can be slow; allow up to 3 minutes)
+    local task_html=$(curl -s -L --max-time 180 "${task_url}" 2>&1)
     
     if [ -z "$task_html" ]; then
         log_error "Failed to fetch Brew task page from ${task_url}"
@@ -826,16 +886,34 @@ get_brew_task_rpms() {
     fi
     
     # Extract all RPM download URLs directly from the task page (full URLs, excluding .src.rpm)
-    # Store them in a temporary file for later use
+    # Use "|| true" so set -e does not abort when parent tasks have no RPM links (build tasks).
     echo "$task_html" | grep -oP 'href="https://[^"]+/brewroot/work/[^"]+\.rpm"' | \
-        cut -d'"' -f2 | grep -v "\.src\.rpm" > "${WORK_DIR}/.brew_rpms.list"
+        cut -d'"' -f2 | grep -v "\.src\.rpm" > "${WORK_DIR}/.brew_rpms.list" || true
+    
+    # If parent task has no RPM links (e.g. it's a "build" task), follow x86_64 buildArch child task
+    if [ ! -s "${WORK_DIR}/.brew_rpms.list" ]; then
+        local child_task_id
+        child_task_id=$(echo "$task_html" | grep "x86_64" | grep -oP 'taskinfo\?taskID=\K\d+' | head -1)
+        if [ -z "$child_task_id" ]; then
+            child_task_id=$(echo "$task_html" | grep "buildArch" | grep -oP 'taskinfo\?taskID=\K\d+' | head -1)
+        fi
+        if [ -n "$child_task_id" ]; then
+            local base_url="${task_url%%\?*}"
+            local child_url="${base_url}?taskID=${child_task_id}"
+            log_info "Parent task has no RPM links; fetching x86_64 buildArch task: ${child_url}"
+            task_html=$(curl -s -L --max-time 180 "${child_url}" 2>&1)
+            [ -n "$task_html" ] || { log_error "Failed to fetch Brew child task page"; exit 1; }
+            echo "$task_html" | grep -oP 'href="https://[^"]+/brewroot/work/[^"]+\.rpm"' | \
+                cut -d'"' -f2 | grep -v "\.src\.rpm" > "${WORK_DIR}/.brew_rpms.list" || true
+        fi
+    fi
     
     # Extract base URL from first RPM
     local first_rpm=$(head -1 "${WORK_DIR}/.brew_rpms.list")
     RPM_BASE_URL=$(echo "$first_rpm" | rev | cut -d'/' -f2- | rev)"/"
     
     if [ -z "$RPM_BASE_URL" ]; then
-        log_error "Could not extract RPM URLs from Brew task page"
+        log_error "Could not extract RPM URLs from Brew task page (and no x86_64 buildArch child found)"
         exit 1
     fi
     
@@ -1194,9 +1272,12 @@ download_rpms() {
     # Determine download URL format (Brew uses full URLs, others use base+filename)
     local services_url cli_url
     if [ -f "${WORK_DIR}/.brew_rpms.list" ]; then
-        # Brew: use full URLs from the list
+        # Brew: use full URLs from the list (CLI is flightctl-cli-VERSION, not flightctl-VERSION)
         services_url=$(cat "${WORK_DIR}/.brew_rpms.list" | grep "flightctl-services.*x86_64.rpm" | head -1)
-        cli_url=$(cat "${WORK_DIR}/.brew_rpms.list" | grep -E "flightctl-[0-9]+\.[0-9]+.*x86_64\.rpm" | grep -v -E "services|agent|observability|telemetry" | head -1)
+        cli_url=$(cat "${WORK_DIR}/.brew_rpms.list" | grep "flightctl-cli.*x86_64.rpm" | head -1)
+        if [ -z "$cli_url" ]; then
+            cli_url=$(cat "${WORK_DIR}/.brew_rpms.list" | grep -E "flightctl-[0-9]+\.[0-9]+.*x86_64\.rpm" | grep -v -E "services|agent|observability|telemetry" | head -1)
+        fi
     else
         # Copr/other: construct URLs from base + filename
         services_url="${RPM_BASE_URL}${services_rpm}"
@@ -2235,15 +2316,15 @@ AGENT_VM_IP=""
 
 # SSH helper for agent VM
 agent_ssh_exec() {
-    sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${AGENT_VM_USER}@${AGENT_VM_IP}" "$@"
+    sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${AGENT_VM_USER}@${AGENT_VM_IP}" "$@"
 }
 
 agent_ssh_exec_sudo() {
-    sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${AGENT_VM_USER}@${AGENT_VM_IP}" "echo '${AGENT_VM_PASSWORD}' | sudo -S $*"
+    sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "${AGENT_VM_USER}@${AGENT_VM_IP}" "echo '${AGENT_VM_PASSWORD}' | sudo -S $*"
 }
 
 agent_scp() {
-    sshpass -p "${AGENT_VM_PASSWORD}" scp -o StrictHostKeyChecking=no "$@"
+    sshpass -p "${AGENT_VM_PASSWORD}" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$@"
 }
 
 # Get agent VM IP from libvirt
@@ -2270,25 +2351,290 @@ get_agent_vm_ip() {
     return 1
 }
 
-# Check if agent VM exists
+# Check if agent VM exists (use sudo to match system libvirt where VMs are created)
 agent_vm_exists() {
-    virsh dominfo "${AGENT_VM_NAME}" &>/dev/null
+    sudo virsh dominfo "${AGENT_VM_NAME}" &>/dev/null
 }
 
 # Check if agent VM is running
 agent_vm_running() {
-    local state=$(virsh domstate "${AGENT_VM_NAME}" 2>/dev/null)
+    local state=$(sudo virsh domstate "${AGENT_VM_NAME}" 2>/dev/null)
     [ "$state" = "running" ]
+}
+
+# Create bootc-based agent VM (OSTree system like make agent-vm)
+create_bootc_agent_vm() {
+    log_info "Creating bootc-based agent VM: ${AGENT_VM_NAME}..."
+    
+    local bootc_image="${BOOTC_IMAGE:-quay.io/centos-bootc/centos-bootc:stream9}"
+    local disk_path="/var/lib/libvirt/images/${AGENT_VM_NAME}.qcow2"
+    local output_dir="${WORK_DIR}/bootc-output"
+    local disk_size="${AGENT_VM_DISK_SIZE:-20}"
+    
+    mkdir -p "${output_dir}"
+    
+    # Check if bootc-image-builder is available
+    if ! command -v podman &>/dev/null; then
+        log_error "podman is required for bootc image building"
+        return 1
+    fi
+    
+    # Build qcow2 from bootc image using bootc-image-builder
+    log_info "Building qcow2 from bootc image: ${bootc_image}"
+    log_info "This may take several minutes on first run..."
+    
+    sudo podman run --rm \
+        -it \
+        --privileged \
+        --pull=newer \
+        --security-opt label=type:unconfined_t \
+        -v "${output_dir}:/output" \
+        -v /var/lib/containers/storage:/var/lib/containers/storage \
+        quay.io/centos-bootc/bootc-image-builder:latest \
+        build \
+        --type qcow2 \
+        --rootfs xfs \
+        "${bootc_image}"
+    
+    if [ ! -f "${output_dir}/qcow2/disk.qcow2" ]; then
+        log_error "Failed to build bootc qcow2 image"
+        return 1
+    fi
+    
+    log_success "Bootc qcow2 image built successfully"
+    
+    # Copy and resize the disk
+    log_info "Copying disk to libvirt images directory..."
+    sudo cp "${output_dir}/qcow2/disk.qcow2" "${disk_path}"
+    sudo qemu-img resize "${disk_path}" "${disk_size}G"
+    
+    # Inject user credentials into bootc image for SSH access
+    log_info "Injecting user credentials into bootc image..."
+    inject_user_into_bootc_image "${disk_path}"
+    
+    # Create VM with virt-install (similar to make agent-vm)
+    log_info "Creating VM with virt-install..."
+    sudo virt-install \
+        --name "${AGENT_VM_NAME}" \
+        --tpm backend.type=emulator,backend.version=2.0,model=tpm-tis \
+        --vcpus "${AGENT_VM_CPUS:-2}" \
+        --memory "${AGENT_VM_MEMORY:-2048}" \
+        --import \
+        --disk "${disk_path},format=qcow2" \
+        --os-variant fedora-eln \
+        --network network=default \
+        --graphics none \
+        --noautoconsole \
+        --wait 0
+    
+    log_success "Bootc agent VM created: ${AGENT_VM_NAME}"
+    
+    # For bootc images, use root user
+    AGENT_VM_USER="root"
+    log_info "Using root user for bootc VM access"
+    
+    # Wait for VM to boot and get IP
+    log_info "Waiting for bootc agent VM to boot..."
+    sleep 45  # Bootc images take longer to boot
+    get_agent_vm_ip
+    
+    # Wait for SSH to be available
+    log_info "Waiting for SSH to be available..."
+    local ssh_attempts=0
+    local max_ssh_attempts=40
+    
+    while [ $ssh_attempts -lt $max_ssh_attempts ]; do
+        if sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+            "root@${AGENT_VM_IP}" "echo 'SSH ready'" &>/dev/null; then
+            log_success "SSH is available on bootc agent VM"
+            return 0
+        fi
+        sleep 5
+        ((ssh_attempts++))
+        log_info "Waiting for SSH (attempt ${ssh_attempts}/${max_ssh_attempts})..."
+    done
+    
+    log_error "SSH not available after ${max_ssh_attempts} attempts"
+    return 1
+}
+
+# Inject user credentials into bootc qcow2 image for SSH access
+inject_user_into_bootc_image() {
+    local disk_path="$1"
+    
+    # Load nbd module if needed
+    sudo modprobe nbd max_part=8 2>/dev/null || true
+    
+    # Find an available nbd device
+    local nbd_device=""
+    for i in $(seq 0 15); do
+        if [ ! -e "/sys/block/nbd${i}/pid" ]; then
+            nbd_device="/dev/nbd${i}"
+            break
+        fi
+    done
+    
+    if [ -z "${nbd_device}" ]; then
+        log_error "No available nbd device found"
+        return 1
+    fi
+    
+    log_info "Using nbd device: ${nbd_device}"
+    
+    # Connect qcow2 to nbd
+    sudo qemu-nbd --connect="${nbd_device}" "${disk_path}"
+    sleep 2
+    
+    # Wait for partitions to appear
+    sudo partprobe "${nbd_device}" 2>/dev/null || true
+    sleep 2
+    
+    # Find and mount the root partition (usually partition 3 on bootc images)
+    local mount_point="${WORK_DIR}/bootc-mount"
+    mkdir -p "${mount_point}"
+    
+    local root_partition=""
+    # Try common partition layouts for bootc images
+    # p4 is typically root (xfs), p3 is boot, p2 is EFI
+    for part in "${nbd_device}p4" "${nbd_device}p3" "${nbd_device}p2"; do
+        if [ -b "${part}" ]; then
+            if sudo mount "${part}" "${mount_point}" 2>/dev/null; then
+                # Check if this looks like an OSTree root with deployments
+                if [ -d "${mount_point}/ostree/deploy" ]; then
+                    root_partition="${part}"
+                    log_info "Mounted root partition: ${part}"
+                    break
+                fi
+                sudo umount "${mount_point}" 2>/dev/null
+            fi
+        fi
+    done
+    
+    if [ -z "${root_partition}" ]; then
+        log_warning "Could not find OSTree root partition, trying alternate methods..."
+        sudo qemu-nbd -d "${nbd_device}" 2>/dev/null || true
+        log_error "Failed to find and mount OSTree root partition"
+        return 1
+    fi
+    
+    # Find the OSTree deployment directory
+    # Structure: /ostree/deploy/<os>/deploy/<checksum>.0/
+    local deploy_dir=""
+    if [ -d "${mount_point}/ostree/deploy" ]; then
+        # List OSTree deployments and find the first one
+        for os_dir in "${mount_point}"/ostree/deploy/*/; do
+            if [ -d "${os_dir}deploy" ]; then
+                # Get the first deployment (usually ends with .0)
+                local deployment=$(ls -1 "${os_dir}deploy" 2>/dev/null | grep -E '\.0$' | head -1)
+                if [ -n "${deployment}" ]; then
+                    deploy_dir="${os_dir}deploy/${deployment}"
+                    break
+                fi
+            fi
+        done
+    fi
+    
+    if [ -z "${deploy_dir}" ] || [ ! -d "${deploy_dir}" ]; then
+        log_error "Could not find OSTree deployment directory"
+        log_info "Contents of ostree/deploy: $(ls -la ${mount_point}/ostree/deploy/ 2>&1 || echo 'not found')"
+        sudo umount "${mount_point}" 2>/dev/null || true
+        sudo qemu-nbd -d "${nbd_device}" 2>/dev/null || true
+        return 1
+    fi
+    
+    log_info "OSTree deployment directory: ${deploy_dir}"
+    
+    # The etc directory is inside the deployment
+    local etc_dir="${deploy_dir}/etc"
+    
+    if [ ! -d "${etc_dir}" ]; then
+        log_error "etc directory not found at ${etc_dir}"
+        sudo umount "${mount_point}" 2>/dev/null || true
+        sudo qemu-nbd -d "${nbd_device}" 2>/dev/null || true
+        return 1
+    fi
+    
+    # Set root password for SSH access (bootc uses root by default)
+    log_info "Setting root password for SSH access..."
+    local password_hash=$(openssl passwd -6 "${AGENT_VM_PASSWORD}")
+    
+    # Update root password in shadow file
+    if sudo grep -q "^root:" "${etc_dir}/shadow" 2>/dev/null; then
+        sudo sed -i "s|^root:[^:]*:|root:${password_hash}:|" "${etc_dir}/shadow"
+    fi
+    
+    # Enable password authentication and root login for SSH
+    local sshd_dir="${etc_dir}/ssh/sshd_config.d"
+    sudo mkdir -p "${sshd_dir}"
+    cat << 'SSHEOF' | sudo tee "${sshd_dir}/50-allow-password.conf" > /dev/null
+PasswordAuthentication yes
+PermitRootLogin yes
+SSHEOF
+    
+    # Inject registry remap configuration (similar to make prepare-e2e-tests)
+    if [ "${ENABLE_LOCAL_REGISTRY:-false}" = "true" ]; then
+        log_info "Injecting registry remap configuration into bootc image..."
+        
+        # Get host IP on libvirt bridge (accessible from VMs)
+        local host_ip=$(ip addr show virbr0 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
+        if [ -z "${host_ip}" ]; then
+            host_ip="192.168.122.1"  # Default libvirt bridge IP
+        fi
+        local registry_port="${LOCAL_REGISTRY_PORT:-5000}"
+        local registry_url="${host_ip}:${registry_port}"
+        
+        # Create containers registries.conf.d directory
+        local registries_dir="${etc_dir}/containers/registries.conf.d"
+        sudo mkdir -p "${registries_dir}"
+        
+        # Write registry remap configuration
+        cat << REGEOF | sudo tee "${registries_dir}/flightctl-remap.conf" > /dev/null
+[[registry]]
+prefix = "quay.io/flightctl"
+location = "${registry_url}/flightctl"
+insecure = true
+REGEOF
+        
+        log_success "Registry remap injected: quay.io/flightctl -> ${registry_url}/flightctl"
+        
+        # Export for use by other functions
+        export LOCAL_REGISTRY_URL="${registry_url}"
+    fi
+    
+    # For bootc, override AGENT_VM_USER to root
+    log_info "Bootc image will use root user for SSH access"
+    
+    # Unmount and disconnect
+    log_info "Cleaning up nbd mount..."
+    sync
+    sudo umount "${mount_point}" 2>/dev/null || true
+    sleep 1
+    sudo qemu-nbd -d "${nbd_device}" 2>/dev/null || true
+    
+    log_success "User credentials injected into bootc image"
+    return 0
 }
 
 # Create agent VM using cloud-init
 create_agent_vm() {
     log_info "Creating agent VM: ${AGENT_VM_NAME}..."
     
+    # Check if we should use flightctl repo's make agent-vm
+    if [ "${USE_MAKE_AGENT_VM:-false}" = "true" ]; then
+        log_info "Using flightctl repo's make agent-vm..."
+        create_agent_vm_via_make
+        return $?
+    fi
+    
     local image_url=""
     local os_variant="rocky9"
     
     case "${AGENT_VM_IMAGE:-rocky9}" in
+        "bootc"|"BOOTC"|"centos-bootc")
+            # Use bootc-based VM creation (same as make agent-vm)
+            create_bootc_agent_vm
+            return $?
+            ;;
         "rocky9"|"ROCKY9")
             image_url="https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
             os_variant="rocky9"
@@ -2418,7 +2764,7 @@ start_agent_vm() {
     if agent_vm_running; then
         log_info "Agent VM is already running"
     else
-        virsh start "${AGENT_VM_NAME}"
+        sudo virsh start "${AGENT_VM_NAME}"
         sleep 10
     fi
     
@@ -2429,10 +2775,56 @@ start_agent_vm() {
 cleanup_agent_vm() {
     log_info "Cleaning up agent VM: ${AGENT_VM_NAME}..."
     
-    virsh destroy "${AGENT_VM_NAME}" 2>/dev/null || true
-    virsh undefine "${AGENT_VM_NAME}" --remove-all-storage 2>/dev/null || true
+    sudo virsh destroy "${AGENT_VM_NAME}" 2>/dev/null || true
+    sudo virsh undefine "${AGENT_VM_NAME}" --remove-all-storage 2>/dev/null || true
     
     log_success "Agent VM cleaned up"
+}
+
+# Force insecureSkipVerify in enrollment and management sections.
+set_insecure_skip_verify_in_config() {
+    local config_file="$1"
+
+    python3 - "$config_file" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+lines = p.read_text().splitlines()
+
+def patch_section(section_name):
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == f"{section_name}:" and not line.startswith(" "):
+            start = i
+            break
+    if start is None:
+        return
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        line = lines[j]
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            end = j
+            break
+
+    for k in range(start + 1, end):
+        if "insecureSkipVerify:" in lines[k]:
+            indent = lines[k].split("insecureSkipVerify:")[0]
+            lines[k] = f"{indent}insecureSkipVerify: true"
+            return
+
+    for k in range(start + 1, end):
+        if lines[k].strip() in ("service:", "service: {}"):
+            if lines[k].strip() == "service: {}":
+                lines[k] = "  service:"
+            lines.insert(k + 1, "    insecureSkipVerify: true")
+            return
+
+patch_section("enrollment-service")
+patch_section("management-service")
+p.write_text("\n".join(lines) + "\n")
+PY
 }
 
 # Generate enrollment config and save to file
@@ -2467,33 +2859,325 @@ generate_enrollment_config() {
         return 1
     fi
     
+    # Agent VM cannot resolve the server hostname (rhel10-1.local); replace with VM_IP
+    # so the agent can reach the server (DNS on 192.168.122.1 does not have the hostname)
+    local vm_hostname=$(ssh_exec "hostname -f" | tr -d '[:space:]')
+    if [ -n "$vm_hostname" ] && [ "$vm_hostname" != "localhost" ]; then
+        log_info "Replacing server hostname ${vm_hostname} with ${VM_IP} in enrollment config (for agent reachability)"
+        sed -i "s|${vm_hostname}|${VM_IP}|g" "${enrollment_config}"
+    fi
+    
+    # Optionally set insecureSkipVerify so the agent skips TLS verification (self-signed server cert)
+    if [ "${AGENT_INSECURE_SKIP_TLS_VERIFY:-false}" = "true" ]; then
+        log_info "Setting insecureSkipVerify: true in enrollment config (agent will skip TLS verification)"
+        set_insecure_skip_verify_in_config "${enrollment_config}"
+    fi
+    
     log_success "Enrollment config with client certificate saved to: ${enrollment_config}"
+    return 0
+}
+
+# Create agent VM using flightctl repo's make agent-vm target
+# This uses the same workflow as: make agent-vm VMNAME=X VMCPUS=X VMDISKSIZE=X VMRAM=X
+create_agent_vm_via_make() {
+    local repo_path="${FLIGHTCTL_REPO_PATH:-}"
+    
+    if [ -z "${repo_path}" ] || [ ! -d "${repo_path}" ]; then
+        log_error "FLIGHTCTL_REPO_PATH not set or directory doesn't exist: ${repo_path}"
+        return 1
+    fi
+    
+    if [ ! -f "${repo_path}/Makefile" ]; then
+        log_error "Makefile not found in ${repo_path}"
+        return 1
+    fi
+    
+    log_info "Creating agent VM using flightctl repo's make agent-vm..."
+    log_info "Repository: ${repo_path}"
+    
+    local vm_name="${AGENT_VM_NAME:-flightctl-agent-test}"
+    local vm_cpus="${MAKE_AGENT_VM_CPUS:-4}"
+    local vm_disksize="${MAKE_AGENT_VM_DISKSIZE:-15G}"
+    local vm_ram="${MAKE_AGENT_VM_RAM:-2048}"
+    
+    log_info "VM Parameters: VMNAME=${vm_name} VMCPUS=${vm_cpus} VMDISKSIZE=${vm_disksize} VMRAM=${vm_ram}"
+    
+    # Clean up existing VM if present
+    log_info "Cleaning up any existing agent VM..."
+    sudo virsh destroy "${vm_name}" 2>/dev/null || true
+    sudo virsh undefine "${vm_name}" --remove-all-storage 2>/dev/null || true
+    sudo rm -f "/var/lib/libvirt/images/${vm_name}.qcow2" 2>/dev/null || true
+    
+    # Run make agent-vm from the flightctl repo
+    log_info "Running: make agent-vm VMNAME=${vm_name} VMCPUS=${vm_cpus} VMDISKSIZE=${vm_disksize} VMRAM=${vm_ram}"
+    
+    pushd "${repo_path}" > /dev/null
+    
+    # Run make agent-vm with parameters
+    # Note: VMWAIT=0 to not wait for console, INJECT_CONFIG=true to inject agent config
+    if make agent-vm \
+        VMNAME="${vm_name}" \
+        VMCPUS="${vm_cpus}" \
+        VMDISKSIZE="${vm_disksize}" \
+        VMRAM="${vm_ram}" \
+        VMWAIT=0 \
+        INJECT_CONFIG=true; then
+        log_success "make agent-vm completed successfully"
+    else
+        log_error "make agent-vm failed"
+        popd > /dev/null
+        return 1
+    fi
+    
+    popd > /dev/null
+    
+    # Wait for VM to boot and get IP
+    log_info "Waiting for agent VM to boot..."
+    sleep 30
+    get_agent_vm_ip
+    
+    # The make agent-vm creates a VM with user 'user' and password 'user'
+    AGENT_VM_USER="user"
+    AGENT_VM_PASSWORD="user"
+    log_info "Agent VM credentials: user=${AGENT_VM_USER}, password=${AGENT_VM_PASSWORD}"
+    
+    # Wait for SSH to be available
+    log_info "Waiting for SSH to be available..."
+    local ssh_attempts=0
+    local max_ssh_attempts=40
+    
+    while [ $ssh_attempts -lt $max_ssh_attempts ]; do
+        if sshpass -p "${AGENT_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+            "${AGENT_VM_USER}@${AGENT_VM_IP}" "echo 'SSH ready'" &>/dev/null; then
+            log_success "SSH is available on agent VM"
+            return 0
+        fi
+        sleep 5
+        ((ssh_attempts++))
+        log_info "Waiting for SSH (attempt ${ssh_attempts}/${max_ssh_attempts})..."
+    done
+    
+    log_error "SSH not available after ${max_ssh_attempts} attempts"
+    return 1
+}
+
+# Prepare e2e environment using flightctl repo's make targets
+# Runs: make prepare-e2e-test (or deploy-e2e-extras + build-e2e-containers + prepare-e2e-qcow-config)
+prepare_e2e_environment() {
+    local repo_path="${FLIGHTCTL_REPO_PATH:-}"
+    
+    if [ -z "${repo_path}" ] || [ ! -d "${repo_path}" ]; then
+        log_warning "FLIGHTCTL_REPO_PATH not set, skipping e2e preparation"
+        return 0
+    fi
+    
+    log_info "Preparing e2e environment using flightctl repo..."
+    log_info "Repository: ${repo_path}"
+    
+    pushd "${repo_path}" > /dev/null
+    
+    # Check if prepare-e2e-test target exists
+    if grep -q "prepare-e2e-test:" Makefile test/test.mk 2>/dev/null; then
+        log_info "Running: make prepare-e2e-test"
+        if make prepare-e2e-test; then
+            log_success "E2E environment prepared successfully"
+        else
+            log_warning "make prepare-e2e-test had issues, continuing..."
+        fi
+    else
+        # Run individual targets
+        log_info "Running: make deploy-e2e-extras"
+        make deploy-e2e-extras || log_warning "deploy-e2e-extras had issues"
+        
+        log_info "Running: make build-e2e-containers"
+        make build-e2e-containers || log_warning "build-e2e-containers had issues"
+        
+        log_info "Running: make prepare-e2e-qcow-config"
+        make prepare-e2e-qcow-config || log_warning "prepare-e2e-qcow-config had issues"
+    fi
+    
+    popd > /dev/null
+    
+    return 0
+}
+
+# Setup local container registry for flightctl-device images
+setup_local_registry() {
+    if [ "${ENABLE_LOCAL_REGISTRY:-false}" != "true" ]; then
+        log_info "Local registry disabled, skipping..."
+        return 0
+    fi
+    
+    log_info "Setting up local container registry..."
+    
+    local registry_port="${LOCAL_REGISTRY_PORT:-5000}"
+    local registry_name="${LOCAL_REGISTRY_NAME:-flightctl-registry}"
+    local host_ip=""
+    
+    # Get the host IP on the libvirt bridge (accessible from VMs)
+    host_ip=$(ip addr show virbr0 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
+    if [ -z "${host_ip}" ]; then
+        host_ip="192.168.122.1"  # Default libvirt bridge IP
+    fi
+    
+    log_info "Host IP for registry: ${host_ip}:${registry_port}"
+    
+    # Check if registry is already running
+    if sudo podman ps --format "{{.Names}}" | grep -q "^${registry_name}$"; then
+        log_info "Local registry already running"
+    else
+        # Check if registry container exists but stopped
+        if sudo podman ps -a --format "{{.Names}}" | grep -q "^${registry_name}$"; then
+            log_info "Starting existing registry container..."
+            sudo podman start "${registry_name}"
+        else
+            log_info "Creating new local registry container..."
+            sudo podman run -d \
+                --name "${registry_name}" \
+                -p "${registry_port}:5000" \
+                --restart always \
+                docker.io/library/registry:2
+        fi
+    fi
+    
+    # Wait for registry to be ready
+    sleep 3
+    
+    # Verify registry is accessible
+    if curl -s "http://${host_ip}:${registry_port}/v2/_catalog" &>/dev/null; then
+        log_success "Local registry is running at ${host_ip}:${registry_port}"
+    else
+        log_warning "Registry may not be accessible yet, continuing..."
+    fi
+    
+    # Export for use by other functions
+    export LOCAL_REGISTRY_URL="${host_ip}:${registry_port}"
+    
+    return 0
+}
+
+# Push flightctl-device images to local registry
+push_device_images_to_registry() {
+    if [ "${ENABLE_LOCAL_REGISTRY:-false}" != "true" ]; then
+        return 0
+    fi
+    
+    log_info "Pushing flightctl-device images to local registry..."
+    
+    local registry_url="${LOCAL_REGISTRY_URL:-192.168.122.1:5000}"
+    local tags="${FLIGHTCTL_DEVICE_TAGS:-v6 v7 v8 v9 v10 v11 base}"
+    local pushed_count=0
+    
+    for tag in ${tags}; do
+        local source_image="quay.io/flightctl/flightctl-device:${tag}"
+        local target_image="${registry_url}/flightctl/flightctl-device:${tag}"
+        
+        # Check if source image exists locally
+        if sudo podman image exists "${source_image}" 2>/dev/null; then
+            log_info "Pushing ${source_image} -> ${target_image}..."
+            
+            # Tag for local registry
+            sudo podman tag "${source_image}" "${target_image}" 2>/dev/null || true
+            
+            # Push to local registry (insecure)
+            if sudo podman push --tls-verify=false "${target_image}" 2>/dev/null; then
+                log_success "Pushed ${tag}"
+                ((pushed_count++))
+            else
+                log_warning "Failed to push ${tag}"
+            fi
+        else
+            log_warning "Image ${source_image} not found locally, skipping..."
+        fi
+    done
+    
+    if [ ${pushed_count} -gt 0 ]; then
+        log_success "Pushed ${pushed_count} images to local registry"
+        
+        # Show available images in registry
+        local catalog=$(curl -s "http://${registry_url}/v2/_catalog" 2>/dev/null || echo "{}")
+        log_info "Registry catalog: ${catalog}"
+    else
+        log_warning "No images were pushed to the registry"
+        log_info "Build images first with: make build-e2e-agent-images (in flightctl repo)"
+    fi
+    
+    return 0
+}
+
+# Configure agent VM to use local registry
+configure_agent_registry_remap() {
+    if [ "${ENABLE_LOCAL_REGISTRY:-false}" != "true" ]; then
+        return 0
+    fi
+    
+    log_info "Configuring agent VM to use local registry..."
+    
+    local registry_url="${LOCAL_REGISTRY_URL:-192.168.122.1:5000}"
+    
+    # Create registry remap configuration
+    local remap_config="[[registry]]
+prefix = \"quay.io/flightctl\"
+location = \"${registry_url}/flightctl\"
+insecure = true"
+    
+    # Write config to agent VM
+    agent_ssh_exec "cat > /etc/containers/registries.conf.d/flightctl-remap.conf << 'EOF'
+${remap_config}
+EOF"
+    
+    # Verify the config was written
+    local verify=$(agent_ssh_exec "cat /etc/containers/registries.conf.d/flightctl-remap.conf 2>/dev/null" || echo "")
+    
+    if echo "${verify}" | grep -q "quay.io/flightctl"; then
+        log_success "Registry remap configured on agent VM"
+        log_info "  quay.io/flightctl -> ${registry_url}/flightctl"
+    else
+        log_warning "Failed to configure registry remap"
+    fi
+    
     return 0
 }
 
 # Install flightctl-agent on agent VM
 install_agent_on_vm() {
     log_info "Installing flightctl-agent on agent VM..."
-    
-    # Get list of available RPMs from the source
-    log_info "Looking for agent RPMs in ${RPM_BASE_URL}..."
-    local rpm_list=$(curl -sL "${RPM_BASE_URL}" | grep -oE "href=['\"][^'\"]*\.rpm['\"]" | sed "s/href=['\"]//;s/['\"]$//" | sort -u)
-    
-    # Find agent RPM
-    local agent_rpm=$(echo "$rpm_list" | grep -E "flightctl-agent.*x86_64\.rpm" | head -1)
-    if [ -z "$agent_rpm" ]; then
-        log_error "Could not find flightctl-agent RPM in ${RPM_BASE_URL}"
-        return 1
+
+    # Optional direct override for agent RPM URL.
+    # Useful when directory listing is incomplete/unavailable or for cross-version testing.
+    local agent_rpm_url_override="${AGENT_RPM_URL:-}"
+    local rpm_list=""
+    local agent_rpm=""
+    local selinux_rpm=""
+    local agent_rpm_url=""
+
+    if [ -n "${agent_rpm_url_override}" ]; then
+        agent_rpm_url="${agent_rpm_url_override}"
+        agent_rpm=$(basename "${agent_rpm_url}")
+        log_info "Using AGENT_RPM_URL override: ${agent_rpm_url}"
+    else
+        # Get list of available RPMs from the source
+        log_info "Looking for agent RPMs in ${RPM_BASE_URL}..."
+        rpm_list=$(curl -sL "${RPM_BASE_URL}" | grep -oE "href=['\"][^'\"]*\.rpm['\"]" | sed "s/href=['\"]//;s/['\"]$//" | sort -u)
+
+        # Find agent RPM
+        agent_rpm=$(echo "$rpm_list" | grep -E "flightctl-agent.*x86_64\.rpm" | head -1)
+        if [ -z "$agent_rpm" ]; then
+            log_error "Could not find flightctl-agent RPM in ${RPM_BASE_URL}"
+            log_error "Set AGENT_RPM_URL in verification.conf to a direct agent RPM URL and retry."
+            return 1
+        fi
+
+        # Find selinux RPM (optional)
+        selinux_rpm=$(echo "$rpm_list" | grep -E "flightctl-selinux.*\.rpm" | head -1)
+        if [ -z "$selinux_rpm" ]; then
+            log_warning "Could not find flightctl-selinux RPM - will try to install without it"
+        fi
+
+        # Download and copy agent RPM
+        agent_rpm_url="${RPM_BASE_URL}${agent_rpm}"
     fi
-    
-    # Find selinux RPM (required dependency)
-    local selinux_rpm=$(echo "$rpm_list" | grep -E "flightctl-selinux.*\.rpm" | head -1)
-    if [ -z "$selinux_rpm" ]; then
-        log_warning "Could not find flightctl-selinux RPM - will try to install without it"
-    fi
-    
-    # Download and copy agent RPM
-    local agent_rpm_url="${RPM_BASE_URL}${agent_rpm}"
+
     local local_agent_rpm="${WORK_DIR}/${agent_rpm}"
     
     if [ ! -f "${local_agent_rpm}" ]; then
@@ -2520,10 +3204,32 @@ install_agent_on_vm() {
     
     # Install RPMs on agent VM
     log_info "Installing agent RPMs..."
+
+    # For bootc systems, use --transient flag to install in a transient overlay
+    local dnf_opts="-y"
+    if [[ "${AGENT_VM_IMAGE:-}" =~ ^(bootc|BOOTC|centos-bootc)$ ]]; then
+        log_info "Using transient overlay for bootc system..."
+        dnf_opts="-y --transient"
+    fi
+
+    # Avoid installing mismatched SELinux policy packages (e.g., el10 policy on el9 bootc agent).
     if [ -n "$selinux_rpm" ]; then
-        agent_ssh_exec_sudo "dnf install -y /tmp/${selinux_rpm} /tmp/${agent_rpm}"
+        local agent_os_major
+        agent_os_major=$(agent_ssh_exec "source /etc/os-release >/dev/null 2>&1; echo \${VERSION_ID%%.*}" 2>/dev/null | tr -dc '0-9')
+        local selinux_el_major
+        selinux_el_major=$(echo "${selinux_rpm}" | sed -n 's/.*\.el\([0-9]\+\).*/\1/p')
+
+        if [ -n "${agent_os_major}" ] && [ -n "${selinux_el_major}" ] && [ "${agent_os_major}" != "${selinux_el_major}" ]; then
+            log_warning "Skipping ${selinux_rpm}: built for el${selinux_el_major}, agent OS is el${agent_os_major}"
+            log_warning "If needed, provide matching direct RPM via AGENT_RPM_URL (and optional selinux RPM in source)."
+            selinux_rpm=""
+        fi
+    fi
+
+    if [ -n "$selinux_rpm" ]; then
+        agent_ssh_exec_sudo "dnf install ${dnf_opts} /tmp/${selinux_rpm} /tmp/${agent_rpm}"
     else
-        agent_ssh_exec_sudo "dnf install -y /tmp/${agent_rpm}"
+        agent_ssh_exec_sudo "dnf install ${dnf_opts} /tmp/${agent_rpm}"
     fi
     
     log_success "flightctl-agent installed on agent VM"
@@ -2541,6 +3247,14 @@ configure_agent() {
         return 1
     fi
     
+    # Ensure stale identity from previous runs does not cause CA mismatch after server reinstall.
+    # This is especially important with FULL_CLEANUP=true on the management VM.
+    if [ "${RESET_AGENT_STATE_BEFORE_ENROLLMENT:-true}" = "true" ]; then
+        log_info "Resetting agent identity state before applying new enrollment config..."
+        agent_ssh_exec_sudo "systemctl stop flightctl-agent 2>/dev/null || true"
+        agent_ssh_exec_sudo "rm -rf /var/lib/flightctl/* /etc/flightctl/config.yaml 2>/dev/null || true"
+    fi
+
     # Copy enrollment config to agent VM
     log_info "Copying enrollment config to agent VM..."
     agent_scp "${enrollment_config}" "${AGENT_VM_USER}@${AGENT_VM_IP}:/tmp/config.yaml"
@@ -2559,7 +3273,7 @@ start_agent_service() {
     log_info "Starting flightctl-agent service..."
     
     agent_ssh_exec_sudo "systemctl enable flightctl-agent"
-    agent_ssh_exec_sudo "systemctl start flightctl-agent"
+    agent_ssh_exec_sudo "systemctl restart flightctl-agent"
     
     sleep 5
     
@@ -2620,8 +3334,14 @@ approve_enrollment() {
     local approve_cmd="flightctl approve enrollmentrequest ${enrollment_name}"
     
     if [ -n "${DEVICE_LABELS}" ]; then
-        # Use -l flag for labels (comma-separated key=value pairs)
-        approve_cmd="${approve_cmd} -l '${DEVICE_LABELS}'"
+        # Each label needs its own -l flag
+        # Convert "key1=val1,key2=val2" to "-l key1=val1 -l key2=val2"
+        local label_flags=""
+        IFS=',' read -ra LABELS <<< "${DEVICE_LABELS}"
+        for label in "${LABELS[@]}"; do
+            label_flags="${label_flags} -l ${label}"
+        done
+        approve_cmd="${approve_cmd}${label_flags}"
     fi
     
     ssh_exec "${approve_cmd}"
@@ -2639,7 +3359,8 @@ approve_enrollment() {
 wait_for_device() {
     local enrollment_name="$1"
     
-    log_info "Waiting for device to be enrolled..."
+    # Redirect log messages to stderr to avoid contaminating stdout (used for return value)
+    echo -e "${BLUE}[INFO]${NC} Waiting for device to be enrolled..." >&2
     
     local max_attempts=30
     local attempt=1
@@ -2653,17 +3374,17 @@ wait_for_device() {
             local device_name=$(echo "$devices" | jq -r '.items[0].metadata.name' 2>/dev/null)
             local device_status=$(echo "$devices" | jq -r '.items[0].status.summary.status' 2>/dev/null || echo "unknown")
             
-            log_success "Device enrolled: ${device_name} (status: ${device_status})"
+            echo -e "${GREEN}[SUCCESS]${NC} Device enrolled: ${device_name} (status: ${device_status})" >&2
             echo "$device_name"
             return 0
         fi
         
-        log_info "Waiting for device (attempt ${attempt}/${max_attempts})..."
+        echo -e "${BLUE}[INFO]${NC} Waiting for device (attempt ${attempt}/${max_attempts})..." >&2
         sleep 5
         ((attempt++))
     done
     
-    log_error "Device not enrolled after ${max_attempts} attempts"
+    echo -e "${RED}[ERROR]${NC} Device not enrolled after ${max_attempts} attempts" >&2
     return 1
 }
 
@@ -2711,6 +3432,11 @@ test_device_onboarding() {
     # Step 1: Create or start agent VM
     if agent_vm_exists; then
         log_info "Agent VM exists, starting it..."
+        # Bootc VMs use root for SSH; set now so agent_ssh/agent_scp use correct user
+        if [[ "${AGENT_VM_IMAGE:-}" =~ ^(bootc|BOOTC|centos-bootc)$ ]]; then
+            AGENT_VM_USER="root"
+            log_info "Using root user for existing bootc agent VM"
+        fi
         start_agent_vm
     else
         log_info "Creating new agent VM..."
@@ -2722,11 +3448,28 @@ test_device_onboarding() {
         return 1
     fi
     
+    log_info "Agent VM SSH: ssh ${AGENT_VM_USER}@${AGENT_VM_IP}  (password: ${AGENT_VM_PASSWORD})"
+    
     # Step 2: Generate enrollment config
     generate_enrollment_config
     
+    # Step 2.5: Prepare e2e environment (if using flightctl repo)
+    if [ "${USE_MAKE_AGENT_VM:-false}" = "true" ] && [ -n "${FLIGHTCTL_REPO_PATH:-}" ]; then
+        prepare_e2e_environment
+    else
+        # Setup local registry (if enabled and not using make agent-vm)
+        setup_local_registry
+        push_device_images_to_registry
+    fi
+    
     # Step 3: Install agent on VM
     install_agent_on_vm
+    
+    # Note: Registry remap is now injected into bootc image during creation
+    # For non-bootc VMs, configure registry remap after VM is running
+    if [[ ! "${AGENT_VM_IMAGE:-}" =~ ^(bootc|BOOTC|centos-bootc)$ ]]; then
+        configure_agent_registry_remap
+    fi
     
     # Step 4: Configure agent
     configure_agent
@@ -2803,6 +3546,7 @@ main() {
     
     get_vm_ip
     setup_passwordless_sudo
+    ensure_vm_hostname
     
     # Full cleanup if requested
     if [ "${FULL_CLEANUP:-false}" = "true" ]; then
