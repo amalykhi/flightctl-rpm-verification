@@ -1,570 +1,219 @@
-# FlightCtl OIDC Verification Script
+# FlightCtl RPM Verification Script
 
-This script automates the complete process of installing, configuring, and verifying FlightCtl services with OIDC authentication on a libvirt VM.
+Automates installation, configuration, and full verification of FlightCtl services on libvirt VMs — including PAM Issuer + Keycloak authentication, resource CRUD, UI, and device onboarding.
+
+## Quick Start: Verifying a New Build
+
+### Step 1 — Set the RPM URLs in the config file
+
+**For RHEL9** — edit `verification.conf`:
+```bash
+vim verification.conf
+```
+
+Update these four fields with the Brew task URLs:
+```bash
+RPM_SOURCE="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/"
+
+SERVICES_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-services-X.Y.Z-1.el9.x86_64.rpm"
+CLI_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-cli-X.Y.Z-1.el9.x86_64.rpm"
+
+AGENT_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-agent-X.Y.Z-1.el9.x86_64.rpm"
+AGENT_SELINUX_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-selinux-X.Y.Z-1.el9.noarch.rpm"
+```
+
+**For RHEL10** — edit `verification-rhel10.conf`:
+```bash
+vim verification-rhel10.conf
+```
+
+Update the same four fields using `el10` RPM URLs:
+```bash
+RPM_SOURCE="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/"
+
+SERVICES_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-services-X.Y.Z-1.el10.x86_64.rpm"
+CLI_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-cli-X.Y.Z-1.el10.x86_64.rpm"
+
+AGENT_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-agent-X.Y.Z-1.el10.x86_64.rpm"
+AGENT_SELINUX_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-selinux-X.Y.Z-1.el10.noarch.rpm"
+```
+
+> **You do not download or copy RPMs manually.** The script downloads them automatically from the URLs above.
+
+---
+
+### Step 2 — Ensure the VM is logged in to the Red Hat registry
+
+Brew builds pull container images from `registry.redhat.io`. The VM must be authenticated as root:
+
+```bash
+# SSH into the service VM and run:
+sudo podman login registry.redhat.io
+```
+
+Verify it worked:
+```bash
+sudo podman login --get-login registry.redhat.io
+```
+
+VMs and their default IPs:
+| VM | Libvirt name | Default IP |
+|----|-------------|------------|
+| RHEL9 service VM | `eurolinux9` | `192.168.122.220` |
+| RHEL10 service VM | `rhel10-fips-vm` | `192.168.122.19` |
+
+---
+
+### Step 3 — Run the verification
+
+**RHEL9:**
+```bash
+./verify_flightctl_oidc.sh
+```
+
+**RHEL10:**
+```bash
+./verify_flightctl_oidc.sh verification-rhel10.conf
+```
+
+The script will:
+1. Clean up any previous installation
+2. Download and install the RPMs
+3. Start all FlightCtl services (pulls container images from `registry.redhat.io`)
+4. Test PAM Issuer authentication
+5. Deploy Keycloak and test OIDC authentication
+6. Test UI, CLI, and API
+7. Create a bootc agent VM and enroll a device
+8. Generate a report in `flightctl_verification_<timestamp>/verification_report.md`
+
+---
+
+## Configuration Files
+
+| File | Purpose |
+|------|---------|
+| `verification.conf` | RHEL9 verification (default) |
+| `verification-rhel10.conf` | RHEL10 verification |
+| `verification-rhel9-ds.conf` | RHEL9 downstream builds |
+| `verification-rhel10-ds.conf` | RHEL10 downstream builds |
+
+---
+
+## What Gets Verified
+
+| Check | Description |
+|-------|-------------|
+| RPM install | `flightctl-services` + `flightctl-cli` installed |
+| Services | All 16 flightctl systemd services running |
+| FIPS | FIPS mode status on VM |
+| API version | Server reports expected version |
+| UI | HTTP 200 at `https://<VM_IP>:443` |
+| PAM Issuer auth | Login + fleet/device/repo CRUD |
+| Keycloak OIDC auth | Login + JWT claims (`organizations`, `roles`) |
+| Device onboarding | Agent VM created, enrolled, joined fleet, status Online |
+| SELinux | Agent binary has `flightctl_agent_exec_t` context |
+
+---
 
 ## Prerequisites
 
-The script requires the following tools to be installed on your host machine:
-
+Install on the host machine:
 ```bash
 sudo dnf install -y virsh sshpass curl wget jq
-
-# Optional: For VM auto-creation
-sudo dnf install -y virt-install libvirt qemu-kvm
 ```
 
-## Configuration
+---
 
-**All settings are now centralized in `verification.conf`!**
+## Key Configuration Options
 
-Edit this file to customize your environment:
-
-```bash
-vim verification.conf
-```
-
-### Key Configuration Options
+### `verification.conf` / `verification-rhel10.conf`
 
 ```bash
-# VM Configuration
-VM_NAME="eurolinux9"              # VM name
-VM_USER="amalykhi"                # SSH user
-VM_PASSWORD=" "                   # SSH password
+# Which VM to use
+VM_NAME="eurolinux9"          # RHEL9 | "rhel10-fips-vm" for RHEL10
+VM_USER="amalykhi"
+VM_PASSWORD=" "               # Single space
 
-# VM Auto-Creation (NEW!)
-CREATE_VM_IF_MISSING="false"     # Set to "true" to auto-create VM
-VM_MEMORY="4096"                  # RAM in MB
-VM_CPUS="2"                       # Number of CPUs
-VM_DISK_SIZE="20"                 # Disk size in GB
-VM_INSTALL_SOURCE="https://..."  # Installation URL or ISO
+# RPM source (Brew task directory URL)
+RPM_SOURCE="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/..."
 
-# RPM Source
-RPM_SOURCE="LATEST"               # Or specific URL
+# Direct RPM overrides (set these for each new build)
+SERVICES_RPM_URL="https://..."
+CLI_RPM_URL="https://..."
+AGENT_RPM_URL="https://..."
+AGENT_SELINUX_RPM_URL="https://..."
 
-# OIDC Configuration
-OIDC_REALM="myrealm"
-OIDC_CLIENT_ID="my_client"
+# Authentication (both = PAM Issuer + Keycloak)
+AUTH_TYPE="both"              # pam | keycloak | both | none
 
-# Test User (for Keycloak)
-TEST_USER="testuser"
-TEST_PASSWORD="password"
+# Device onboarding
+ENABLE_DEVICE_ONBOARDING="true"
+AGENT_VM_NAME="flightctl-agent-test-2"   # RHEL9 | "flightctl-agent-test-rhel10" for RHEL10
+AGENT_VM_IMAGE="bootc"
+BOOTC_IMAGE="quay.io/centos-bootc/centos-bootc:stream9"   # stream9 for el9 | stream10 for el10
 
-# Authentication Type
-AUTH_TYPE="both"                  # pam, keycloak, both, or none
-```
-
-**See `verification.conf` for all available options.**
-
-### Authentication Types
-
-The script supports multiple authentication configurations via `AUTH_TYPE`:
-
-| AUTH_TYPE | Description | Use Case |
-|-----------|-------------|----------|
-| `both` | Test PAM Issuer AND Keycloak | **Default** - Full verification |
-| `pam` | PAM Issuer only (built-in) | Simple setup, no external dependencies |
-| `keycloak` | Keycloak OIDC only | External OIDC provider testing |
-| `none` | Skip authentication | Quick install without auth |
-
-#### PAM Issuer (Recommended for rc3+)
-
-PAM Issuer is FlightCtl's built-in OIDC provider. It starts automatically and requires no external setup.
-
-```bash
-# In verification.conf
-AUTH_TYPE="pam"
-PAM_USER="admin"
-PAM_PASSWORD="admin123"
-PAM_ROLE="flightctl-admin"
-```
-
-Login command:
-```bash
-flightctl login https://<VM_IP>:3443 -k -u admin -p admin123
-```
-
-#### Keycloak OIDC
-
-External Keycloak for enterprise OIDC testing. The script auto-deploys and configures Keycloak.
-
-```bash
-# In verification.conf
-AUTH_TYPE="keycloak"
-OIDC_REALM="myrealm"
-OIDC_CLIENT_ID="my_client"
-TEST_USER="testuser"
-TEST_PASSWORD="password"
-```
-
-#### Both (Default)
-
-Tests both authentication methods for comprehensive verification:
-
-```bash
-# In verification.conf
-AUTH_TYPE="both"
-```
-
-This will:
-1. Start PAM Issuer (built-in)
-2. Deploy and configure Keycloak
-3. Create users in both systems
-4. Test authentication with both providers
-
-#### None (No Authentication)
-
-Skip authentication configuration entirely:
-
-```bash
-# In verification.conf
-AUTH_TYPE="none"
-```
-
-Useful for:
-- Quick installation testing
-- Development environments
-- Debugging service issues
-
-### Full Cleanup Option
-
-Enable `FULL_CLEANUP` for a completely fresh installation:
-
-```bash
-# In verification.conf
+# Full cleanup before each run (recommended)
 FULL_CLEANUP="true"
+
+# FIPS
+ENABLE_FIPS="verify"          # verify | true | false
 ```
 
-This removes:
-- All FlightCtl containers
-- Keycloak container
-- Podman volumes (database, etc.)
-- FlightCtl RPMs
-- Config directories
-
-**Use this when switching between versions or auth configurations.**
-
-## Usage
-
-### Method 1: Using Configuration File (Recommended)
-
-**Step 1**: Edit `verification.conf` with your settings
-
-**Step 2**: Run the script:
-
-```bash
-./verify_flightctl_oidc.sh
-```
-
-That's it! The script reads all settings from `verification.conf`.
-
-### Method 2: Using Command-Line Arguments (Legacy)
-
-```bash
-./verify_flightctl_oidc.sh <VM_NAME> <RPM_URL|LATEST>
-```
-
-**Parameters:**
-- `VM_NAME`: Name of the libvirt VM (e.g., `eurolinux9`)
-- `RPM_URL|LATEST`: Either:
-  - Full URL to the RPM repository, OR
-  - `LATEST` to automatically use the most recent successful build
-
-## Examples
-
-### 🌟 Example 1: Use Default Config
-
-```bash
-# Edit config first
-vim verification.conf
-
-# Run with config
-./verify_flightctl_oidc.sh
-```
-
-### 🚀 Example 2: Auto-Create VM (NEW!)
-
-In `verification.conf`:
-
-```bash
-# Enable VM auto-creation
-CREATE_VM_IF_MISSING="true"
-
-# VM will be created if it doesn't exist!
-VM_NAME="my-new-vm"
-VM_MEMORY="4096"
-VM_CPUS="2"
-VM_DISK_SIZE="20"
-VM_INSTALL_SOURCE="https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/"
-VM_KICKSTART_FILE="https://myserver.com/kickstart.cfg"  # Optional
-```
-
-Run the script - VM will be created automatically:
-
-```bash
-./verify_flightctl_oidc.sh
-```
-
-**See `VM_CREATION_GUIDE.md` for complete VM creation documentation.**
-
-### Example 3: Use Custom Config File
-
-```bash
-# Create custom config
-cp verification.conf my_test.conf
-vim my_test.conf
-
-# Run with custom config
-./verify_flightctl_oidc.sh my_test.conf
-```
-
-### Example 4: Legacy Mode with LATEST
-
-```bash
-./verify_flightctl_oidc.sh eurolinux9 LATEST
-```
-
-## What the Script Does
-
-### Complete Workflow
-
-1. **Configuration Loading**:
-   - Loads settings from `verification.conf`
-   - Supports command-line overrides for backward compatibility
-
-2. **Prerequisites Check**: 
-   - Verifies all required tools are available
-   - Checks for virt-install if VM creation is enabled
-
-3. **VM Management** (NEW!):
-   - Checks if VM exists
-   - **Auto-creates VM** if missing (when `CREATE_VM_IF_MISSING=true`)
-   - Starts VM if it's stopped
-   - Waits for VM to be ready
-   - Gets VM IP address
-   - Tests connectivity
-
-4. **RPM Source Detection**:
-   - If `LATEST` or `RPM_SOURCE="LATEST"`: Automatically queries Copr builds page and finds the newest successful build
-   - If URL is specified: Uses the provided URL directly
-
-5. **RPM Download**: 
-   - Downloads flightctl-services and flightctl-cli RPMs from the determined source
-   - Saves to timestamped work directory
-
-6. **VM Preparation**:
-   - Copies RPMs to VM
-   - Stops existing FlightCtl services
-   - Removes old packages
-
-7. **Installation**:
-   - Installs new RPM packages
-   - Verifies container images are available
-
-8. **OIDC Configuration**:
-   - Updates `/etc/flightctl/service-config.yaml`
-   - Regenerates `/etc/flightctl/flightctl-api/config.yaml` from template
-   - Configures OIDC with Keycloak settings
-
-9. **Service Management**:
-   - Starts all FlightCtl services
-   - Waits for services to stabilize
-   - Checks service status
-
-10. **Authentication Configuration**:
-   - PAM Issuer: Verifies service is running, creates user
-   - Keycloak: Deploys container, creates realm/client/user
-   - Tests token endpoints and CLI login
-
-11. **Resource Verification** (NEW!):
-   - Creates test Fleet (`flightctl apply`)
-   - Creates test Repository
-   - Lists Fleets, Repositories, Devices
-   - Checks Enrollment Requests
-   - Verifies API version
-   - Cleans up test resources
-
-12. **Component Testing**:
-   - Tests CLI access (flightctl get devices/fleets)
-   - Tests UI accessibility (HTTP 200 check)
-   - Tests API functionality
-   - Checks OIDC authentication status
-
-13. **Reporting**:
-   - Collects logs from failed services
-   - Generates comprehensive verification report
+---
 
 ## Output
 
-The script creates a timestamped directory with:
+Each run creates a timestamped directory:
 
 ```
 flightctl_verification_YYYYMMDD_HHMMSS/
-├── verification_report.md    # Detailed verification report
-├── logs/                      # Service logs (if any failures)
-│   ├── service1.log
-│   └── service2.log
-├── *.rpm                      # Downloaded RPM files
-└── index.html                 # Repository index
+├── verification_report.md     # Full verification report
+├── logs/                      # Logs from any failed services
+├── flightctl-services-*.rpm   # Downloaded RPMs
+├── flightctl-cli-*.rpm
+└── enrollment-config.yaml     # Agent enrollment config
 ```
 
-## Configuration
+---
 
-### VM Requirements
+## Access Points After Verification
 
-- **OS**: RHEL-based (RHEL 9, CentOS 9, EuroLinux 9, etc.)
-- **User**: `amalykhi` with password ` ` (single space)
-- **Access**: SSH access with sudo privileges
-- **Network**: Reachable from host machine
-- **Registry Access**: For Brew RPMs, login to Red Hat registry is required:
+| Endpoint | RHEL9 | RHEL10 |
+|----------|-------|--------|
+| UI | https://192.168.122.220:443 | https://192.168.122.19:443 |
+| API | https://192.168.122.220:3443 | https://192.168.122.19:3443 |
 
+**Login commands (PAM Issuer):**
 ```bash
-# Run on the VM
-sudo podman login registry.redhat.io -u <RH_username>
-```
-
-> **Note**: This is required when using Brew RPMs as they pull container images from `registry.redhat.io` which requires authentication. Copr builds use public registries and don't require this step.
-
-### OIDC Settings (Customizable in script)
-
-- **Realm**: `myrealm`
-- **Client ID**: `my_client`
-- **Authority**: `http://VM_IP:8080/realms/myrealm`
-
-To change these, edit the script variables:
-
-```bash
-OIDC_REALM="myrealm"
-OIDC_CLIENT_ID="my_client"
-```
-
-## Verification Report
-
-The generated report includes:
-
-- ✅ Installation summary
-- 📦 Installed packages and versions
-- 🐳 Container images
-- 🔄 Service status (running/failed)
-- 🔐 OIDC configuration
-- 🔗 Access points (API, UI, CLI)
-- 📝 CLI usage examples
-- 📋 Failed service logs
-
-## Accessing FlightCtl After Installation
-
-### CLI Access
-
-```bash
-# SSH to VM
-ssh amalykhi@<VM_IP>
-
-# Login to FlightCtl (PAM Issuer - default in rc3+)
 flightctl login https://<VM_IP>:3443 -k -u admin -p admin123
-
-# Or use web-based login
-flightctl login https://<VM_IP>:3443 -k --web
-
-# List devices
-flightctl get devices
-
-# List fleets
-flightctl get fleets
-
-# Create a fleet
-flightctl apply -f my-fleet.yaml
 ```
 
-### UI Access
-
-Open in browser:
-```
-https://<VM_IP>:443
-```
-
-### API Access
-
+**Login commands (Keycloak):**
 ```bash
-curl -k https://<VM_IP>:3443/api/v1/devices
+flightctl login https://<VM_IP>:3443 -k -u testuser -p password
 ```
 
-## 🌟 Key Features
+---
 
-### ✅ Centralized Configuration
-- **All settings in `verification.conf`**
-- No need to edit scripts
-- Easy to maintain multiple environments
-- Version control friendly
+## Troubleshooting
 
-### ✅ Automated VM Creation (NEW!)
-- Auto-create VMs if missing
-- Multiple installation methods (URL, ISO, PXE)
-- Kickstart and Cloud-init support
-- Perfect for CI/CD pipelines
+### Services stuck in `auto-restart`
+The VM is not logged in to the registry. Run on the VM:
+```bash
+sudo podman login registry.redhat.io
+```
 
-### ✅ Flexible Authentication Options (NEW!)
-- **PAM Issuer**: Built-in OIDC provider (no external deps)
-- **Keycloak**: Auto-deployed and configured
-- **Both**: Test both auth methods
-- **None**: Skip auth for quick testing
-- End-to-end authentication verification
+### Agent VM SSH fails
+The agent VM has a stale/broken state. Destroy it and rerun — the script will create a fresh one:
+```bash
+sudo virsh destroy flightctl-agent-test-2
+sudo virsh undefine flightctl-agent-test-2 --remove-all-storage
+./verify_flightctl_oidc.sh
+```
 
-### ✅ Resource Verification (NEW!)
-- Creates and verifies Fleets
-- Creates and verifies Repositories
-- Tests all CRUD operations
-- Automatic cleanup after tests
-
-### ✅ Smart VM Management
-- Auto-starts stopped VMs
-- Waits for VM readiness
-- Handles IP address detection
-- Tests connectivity
-
-### ✅ Automatic LATEST Build Detection
-- Queries Copr for newest build
-- No manual URL lookup needed
-- Always uses most recent version
-
-### ✅ Comprehensive Reporting
-- Timestamped work directories
-- Service status details
-- OIDC configuration
-- Failed service logs
-- CLI usage examples
-
-## 📖 Additional Documentation
-
-- **`verification.conf`** - Main configuration file with all options
-- **`VM_CREATION_GUIDE.md`** - Complete VM auto-creation guide
-- **`CONFIG_AND_AUTH_TESTING.md`** - Configuration and OIDC testing details
-- **`TEST_RESULTS_SUCCESS.md`** - Example successful test results
-- **`FINAL_OIDC_STATUS_REPORT.md`** - Detailed OIDC analysis
-
-## Common Issues and Solutions
-
-### Issue: VM not found
-**Solution**: Either:
-- Set `CREATE_VM_IF_MISSING="true"` in `verification.conf` to auto-create VM
-- Create VM manually first
-- Verify VM name with `sudo virsh list --all`
-
-### Issue: Cannot connect to VM
-**Solution**: 
-- Check VM is running: `sudo virsh list`
-- Verify network: `sudo virsh domifaddr <VM_NAME>`
-- Check SSH access manually: `ssh amalykhi@<VM_IP>`
-
-### Issue: RPM download fails
-**Solution**: Verify RPM URL is correct and accessible
-
-### Issue: Container images missing
-**Script handles**: Automatically retags 0.10.0 images to required version
-
-### Issue: OIDC not working
-**Expected**: OIDC authentication may be disabled if:
-- Keycloak is not configured for HTTPS
-- PAM issuer image is not available
-- This is documented in the report
-
-## Exit Codes
-
-- `0`: Success
-- `1`: Error (with descriptive message)
-
-## Logs and Debugging
-
-### View script output:
-The script provides colored output with INFO, SUCCESS, WARNING, and ERROR messages.
-
-### Check service status on VM:
+### Check service status on VM
 ```bash
 ssh amalykhi@<VM_IP>
-sudo systemctl list-units 'flightctl*'
-```
-
-### View service logs on VM:
-```bash
-ssh amalykhi@<VM_IP>
+sudo systemctl list-units 'flightctl*' --all
 sudo journalctl -u flightctl-api.service -n 50
-sudo podman logs flightctl-api
 ```
-
-## Customization
-
-To modify VM credentials, edit these variables in the script:
-
-```bash
-VM_USER="amalykhi"
-VM_PASSWORD=" "  # Single space character
-```
-
-To use a different work directory:
-
-```bash
-WORK_DIR="/custom/path"
-```
-
-## Notes
-
-- The script is idempotent - safe to run multiple times
-- Old packages are cleanly removed before new installation
-- Container images are automatically managed
-- All operations are logged with timestamps
-- Authentication may be disabled by default (documented in report)
-
-## Support
-
-For issues or questions:
-1. Check the generated verification report
-2. Review service logs in the logs directory
-3. Check FlightCtl documentation
-
-## Example Run
-
-### Using LATEST option:
-
-```bash
-$ ./verify_flightctl_oidc.sh eurolinux9 LATEST
-
-==================================
-FlightCtl OIDC Verification Script
-==================================
-
-[INFO] VM Name: eurolinux9
-[INFO] Work Directory: /home/amalykhi/flightctl_verification_20251106_154530
-
-[INFO] Checking prerequisites...
-[SUCCESS] All prerequisites available
-[INFO] Determining RPM source URL...
-[INFO] Using LATEST build option
-[INFO] Fetching latest successful build from Copr...
-[INFO] Found latest build ID: 9772870
-[SUCCESS] Latest build URL: https://download.copr.fedorainfracloud.org/results/@redhat-et/flightctl-dev/epel-9-x86_64/09772870-flightctl/
-[SUCCESS] Build URL verified and accessible
-[INFO] RPM Base URL: https://download.copr.fedorainfracloud.org/results/@redhat-et/flightctl-dev/epel-9-x86_64/09772870-flightctl/
-
-[INFO] Checking prerequisites...
-[SUCCESS] All prerequisites available
-[INFO] Getting VM IP address for eurolinux9...
-[SUCCESS] VM IP: 192.168.122.219
-[SUCCESS] VM is reachable
-[INFO] Downloading FlightCtl RPMs...
-[SUCCESS] Downloaded flightctl-services-1.0.0~main~222-1.el9.x86_64.rpm
-[SUCCESS] Downloaded flightctl-cli-1.0.0~main~222-1.el9.x86_64.rpm
-[INFO] Copying RPMs to VM...
-[SUCCESS] RPMs copied to VM
-...
-[SUCCESS] CLI is working - can query devices
-[SUCCESS] UI is accessible at https://192.168.122.219:443
-[SUCCESS] API is working - returned DeviceList
-
-==================================
-[SUCCESS] Verification Complete!
-==================================
-
-[INFO] Report: /home/amalykhi/flightctl_verification_20251106_154530/verification_report.md
-[INFO] Quick Access:
-[INFO]   API: https://192.168.122.219:3443
-[INFO]   UI:  https://192.168.122.219:443
-```
-
