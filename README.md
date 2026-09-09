@@ -13,13 +13,13 @@ vim verification.conf
 
 Update these four fields with the Brew task URLs:
 ```bash
-RPM_SOURCE="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/"
+RPM_SOURCE="<BREW_DOWNLOAD_URL>"
 
-SERVICES_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-services-X.Y.Z-1.el9.x86_64.rpm"
-CLI_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-cli-X.Y.Z-1.el9.x86_64.rpm"
+SERVICES_RPM_URL="<BREW_DOWNLOAD_URL>"
+CLI_RPM_URL="<BREW_DOWNLOAD_URL>"
 
-AGENT_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-agent-X.Y.Z-1.el9.x86_64.rpm"
-AGENT_SELINUX_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-selinux-X.Y.Z-1.el9.noarch.rpm"
+AGENT_RPM_URL="<BREW_DOWNLOAD_URL>"
+AGENT_SELINUX_RPM_URL="<BREW_DOWNLOAD_URL>"
 ```
 
 **For RHEL10** — edit `verification-rhel10.conf`:
@@ -29,13 +29,13 @@ vim verification-rhel10.conf
 
 Update the same four fields using `el10` RPM URLs:
 ```bash
-RPM_SOURCE="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/"
+RPM_SOURCE="<BREW_DOWNLOAD_URL>"
 
-SERVICES_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-services-X.Y.Z-1.el10.x86_64.rpm"
-CLI_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-cli-X.Y.Z-1.el10.x86_64.rpm"
+SERVICES_RPM_URL="<BREW_DOWNLOAD_URL>"
+CLI_RPM_URL="<BREW_DOWNLOAD_URL>"
 
-AGENT_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-agent-X.Y.Z-1.el10.x86_64.rpm"
-AGENT_SELINUX_RPM_URL="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/<TASK_ID>/<FULL_TASK_ID>/flightctl-selinux-X.Y.Z-1.el10.noarch.rpm"
+AGENT_RPM_URL="<BREW_DOWNLOAD_URL>"
+AGENT_SELINUX_RPM_URL="<BREW_DOWNLOAD_URL>"
 ```
 
 > **You do not download or copy RPMs manually.** The script downloads them automatically from the URLs above.
@@ -135,7 +135,7 @@ VM_USER="amalykhi"
 VM_PASSWORD=" "               # Single space
 
 # RPM source (Brew task directory URL)
-RPM_SOURCE="https://download-01.beak-001.prod.iad2.dc.redhat.com/brewroot/work/tasks/..."
+RPM_SOURCE="<BREW_DOWNLOAD_URL>"
 
 # Direct RPM overrides (set these for each new build)
 SERVICES_RPM_URL="https://..."
