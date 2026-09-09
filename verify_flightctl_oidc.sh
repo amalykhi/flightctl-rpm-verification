@@ -13,6 +13,8 @@
 #
 # Usage:
 #   ./verify_flightctl_oidc.sh [VM_NAME] [RPM_URL|LATEST]
+#   VERIFY_RUN_MODE=agent_ui_only ./verify_flightctl_oidc.sh
+#     — UI check + device onboarding only (no cleanup, no reinstall). Optional: VERIFY_WORK_DIR=/path/to/flightctl_verification_*
 #
 # Examples:
 #   # Use config file defaults
@@ -43,12 +45,16 @@ CONFIG_FILE="${1:-${SCRIPT_DIR}/verification.conf}"
 # CLI overrides (applied after sourcing; sourcing must not clobber these)
 CLI_VM_NAME=""
 CLI_RPM_URL_ARG=""
+# True when user passed VM + RPM URL on CLI (second arg); verification.conf
+# SERVICES_RPM_URL / CLI_RPM_URL must not override that source.
+CLI_PASSED_RPM_URL="false"
 
 # Check for legacy command line args (VM_NAME, RPM_URL)
 if [ $# -eq 2 ] && [ ! -f "${1}" ]; then
     # Legacy mode: first arg is VM_NAME, second is RPM_URL
     CLI_VM_NAME="${1}"
     CLI_RPM_URL_ARG="${2}"
+    CLI_PASSED_RPM_URL="true"
     CONFIG_FILE="${SCRIPT_DIR}/verification.conf"
 elif [ $# -eq 1 ] && [ ! -f "${1}" ]; then
     # Legacy mode: first arg is VM_NAME
@@ -529,8 +535,12 @@ spec:
       env: test
   template:
     spec:
-      os:
-        image: quay.io/centos-bootc/centos-bootc:stream9"
+      config:
+        - name: verification-inline
+          inline:
+            - path: /etc/flightctl-verification-marker
+              content: 'flightctl-verification-resource-test'
+              mode: 0644"
     
     local create_result=$(ssh_exec "echo '${fleet_yaml}' | flightctl apply -f - 2>&1" || echo "")
     
@@ -1226,11 +1236,23 @@ get_vm_ip() {
 }
 
 download_rpms() {
-    log_info "Downloading FlightCtl RPMs from ${RPM_BASE_URL}..."
-    
     mkdir -p "${WORK_DIR}"
     cd "${WORK_DIR}"
-    
+
+    # Check if RPMs already exist in WORK_DIR (manual download or pre-copied)
+    local existing_services=$(ls flightctl-services-*.rpm 2>/dev/null | head -1 || true)
+    local existing_cli=$(ls flightctl-cli-*.rpm 2>/dev/null | head -1 || true)
+
+    if [ -n "$existing_services" ] && [ -n "$existing_cli" ]; then
+        log_info "Found pre-downloaded RPMs in ${WORK_DIR}:"
+        log_info "  - ${existing_services}"
+        log_info "  - ${existing_cli}"
+        log_success "Skipping download, using existing RPMs"
+        return 0
+    fi
+
+    log_info "Downloading FlightCtl RPMs from ${RPM_BASE_URL}..."
+
     local rpm_files=""
     
     # Check if we have direct URLs from Brew
@@ -1262,6 +1284,9 @@ download_rpms() {
     done <<< "$rpm_files"
     
     # Download flightctl-services and flightctl-cli
+    # Optional exact URL overrides from verification.conf:
+    #   SERVICES_RPM_URL="https://.../flightctl-services-...rpm"
+    #   CLI_RPM_URL="https://.../flightctl-cli-...rpm"
     local services_rpm=$(echo "$rpm_files" | grep "flightctl-services.*x86_64.rpm" | head -1)
     # Try Copr naming first (flightctl-cli), then Brew naming (flightctl-X.X.X without -cli, -services, -agent, etc.)
     local cli_rpm=$(echo "$rpm_files" | grep "flightctl-cli.*x86_64.rpm" | head -1)
@@ -1282,6 +1307,23 @@ download_rpms() {
         # Copr/other: construct URLs from base + filename
         services_url="${RPM_BASE_URL}${services_rpm}"
         cli_url="${RPM_BASE_URL}${cli_rpm}"
+    fi
+
+    # Respect verification.conf direct RPM URL overrides only when RPM source was
+    # not passed as the second CLI argument (otherwise conf pins an old task/build).
+    if [ "${CLI_PASSED_RPM_URL:-false}" = "true" ]; then
+        log_info "RPM source from CLI — ignoring SERVICES_RPM_URL / CLI_RPM_URL in config for this run"
+    else
+        if [ -n "${SERVICES_RPM_URL:-}" ]; then
+            services_url="${SERVICES_RPM_URL}"
+            services_rpm="$(basename "${SERVICES_RPM_URL}")"
+            log_info "Using SERVICES_RPM_URL override: ${services_rpm}"
+        fi
+        if [ -n "${CLI_RPM_URL:-}" ]; then
+            cli_url="${CLI_RPM_URL}"
+            cli_rpm="$(basename "${CLI_RPM_URL}")"
+            log_info "Using CLI_RPM_URL override: ${cli_rpm}"
+        fi
     fi
     
     if [ -n "$services_url" ]; then
@@ -1390,9 +1432,63 @@ install_rpms() {
         exit 1
     fi
     
-    ssh_exec_sudo "dnf install -y ${services_rpm} ${cli_rpm}"
-    
+    ssh_exec_sudo "dnf install -y --disablerepo='edge-manager-1.1-for-rhel-9-x86_64-rpms' --disablerepo='edge-manager-1.1-for-rhel-10-x86_64-rpms' --disablerepo='rhel-10-for-x86_64-baseos-rpms' --disablerepo='rhel-10-for-x86_64-appstream-rpms' ${services_rpm} ${cli_rpm}"
+
     log_success "RPMs installed successfully"
+}
+
+verify_selinux_context() {
+    log_info "Verifying SELinux context for flightctl-agent binary..."
+
+    # Check if SELinux is enabled
+    local selinux_status=$(ssh_exec "getenforce 2>/dev/null" || echo "Unknown")
+    log_info "SELinux status: ${selinux_status}"
+
+    if [ "$selinux_status" = "Disabled" ]; then
+        log_warning "SELinux is disabled, skipping context verification"
+        return 0
+    fi
+
+    # Check if flightctl-agent binary exists
+    if ! ssh_exec "test -f /usr/bin/flightctl-agent"; then
+        log_warning "flightctl-agent binary not found at /usr/bin/flightctl-agent, skipping SELinux verification"
+        return 0
+    fi
+
+    # Get SELinux context of flightctl-agent binary
+    local selinux_context=$(ssh_exec "ls -Z /usr/bin/flightctl-agent 2>/dev/null | awk '{print \$1}'" || echo "")
+
+    if [ -z "$selinux_context" ]; then
+        log_error "Failed to get SELinux context for /usr/bin/flightctl-agent"
+        return 1
+    fi
+
+    log_info "SELinux context: ${selinux_context}"
+
+    # Expected context: system_u:object_r:flightctl_agent_exec_t:s0
+    local expected_type="flightctl_agent_exec_t"
+
+    if echo "$selinux_context" | grep -q "$expected_type"; then
+        log_success "SELinux context is correct: ${selinux_context}"
+        log_success "Binary has proper flightctl_agent_exec_t type"
+        return 0
+    else
+        log_error "SELinux context is incorrect!"
+        log_error "  Expected type: ${expected_type}"
+        log_error "  Actual context: ${selinux_context}"
+
+        # Check if flightctl-selinux package is installed
+        local selinux_rpm=$(ssh_exec "rpm -qa | grep flightctl-selinux" || echo "")
+        if [ -z "$selinux_rpm" ]; then
+            log_error "flightctl-selinux package is not installed"
+            log_info "Install with: sudo dnf install flightctl-selinux"
+        else
+            log_info "flightctl-selinux package installed: ${selinux_rpm}"
+            log_info "You may need to run: sudo restorecon -v /usr/bin/flightctl-agent"
+        fi
+
+        return 1
+    fi
 }
 
 check_container_images() {
@@ -2290,6 +2386,28 @@ flightctl get devices
 flightctl get fleets
 \`\`\`
 
+EOF
+
+    if [ -f "${WORK_DIR}/.verification_fleet_name" ]; then
+        local report_fleet_name
+        report_fleet_name=$(head -1 "${WORK_DIR}/.verification_fleet_name" | tr -d '[:space:]')
+        if [ -n "$report_fleet_name" ]; then
+            cat >> "${REPORT_FILE}" << EOF
+
+## Verification fleet (device onboarding)
+
+Fleet **${report_fleet_name}** was applied with \`selector.matchLabels\` derived from \`DEVICE_LABELS\`. Devices approved with \`flightctl approve ... -l ...\` receive the same labels and join this fleet.
+
+\`\`\`bash
+flightctl get fleet/${report_fleet_name} -o yaml
+flightctl get fleets
+\`\`\`
+EOF
+        fi
+    fi
+
+    cat >> "${REPORT_FILE}" << EOF
+
 ## UI Access
 
 Open in browser: https://${VM_IP}:443
@@ -2366,7 +2484,8 @@ agent_vm_running() {
 create_bootc_agent_vm() {
     log_info "Creating bootc-based agent VM: ${AGENT_VM_NAME}..."
     
-    local bootc_image="${BOOTC_IMAGE:-quay.io/centos-bootc/centos-bootc:stream9}"
+    local bootc_image="${BOOTC_IMAGE:-quay.io/centos-bootc/centos-bootc:stream10}"
+    local virt_os_variant="${BOOTC_VIRT_OS_VARIANT:-fedora-eln}"
     local disk_path="/var/lib/libvirt/images/${AGENT_VM_NAME}.qcow2"
     local output_dir="${WORK_DIR}/bootc-output"
     local disk_size="${AGENT_VM_DISK_SIZE:-20}"
@@ -2382,9 +2501,15 @@ create_bootc_agent_vm() {
     # Build qcow2 from bootc image using bootc-image-builder
     log_info "Building qcow2 from bootc image: ${bootc_image}"
     log_info "This may take several minutes on first run..."
-    
+    # bootc-image-builder expects the base image in local storage (it does not pull it).
+    log_info "Pulling base bootc image into local podman storage..."
+    if ! sudo podman pull "${bootc_image}"; then
+        log_error "Failed to pull bootc image: ${bootc_image}"
+        return 1
+    fi
+
     sudo podman run --rm \
-        -it \
+        -i \
         --privileged \
         --pull=newer \
         --security-opt label=type:unconfined_t \
@@ -2421,7 +2546,7 @@ create_bootc_agent_vm() {
         --memory "${AGENT_VM_MEMORY:-2048}" \
         --import \
         --disk "${disk_path},format=qcow2" \
-        --os-variant fedora-eln \
+        --os-variant "${virt_os_variant}" \
         --network network=default \
         --graphics none \
         --noautoconsole \
@@ -3143,39 +3268,95 @@ EOF"
 install_agent_on_vm() {
     log_info "Installing flightctl-agent on agent VM..."
 
-    # Optional direct override for agent RPM URL.
-    # Useful when directory listing is incomplete/unavailable or for cross-version testing.
-    local agent_rpm_url_override="${AGENT_RPM_URL:-}"
     local rpm_list=""
     local agent_rpm=""
     local selinux_rpm=""
     local agent_rpm_url=""
+    local selinux_rpm_url=""
 
-    if [ -n "${agent_rpm_url_override}" ]; then
-        agent_rpm_url="${agent_rpm_url_override}"
+    # Pinned selinux URL (optional; wins over Brew list / directory pairing).
+    if [ -n "${AGENT_SELINUX_RPM_URL:-}" ]; then
+        selinux_rpm_url="${AGENT_SELINUX_RPM_URL}"
+        selinux_rpm=$(basename "${selinux_rpm_url}")
+        log_info "Using AGENT_SELINUX_RPM_URL (pinned): ${selinux_rpm_url}"
+    fi
+
+    # 0) Pinned agent URL wins (cross-OS / explicit build; overrides Brew list and directory).
+    if [ -n "${AGENT_RPM_URL:-}" ]; then
+        agent_rpm_url="${AGENT_RPM_URL}"
         agent_rpm=$(basename "${agent_rpm_url}")
-        log_info "Using AGENT_RPM_URL override: ${agent_rpm_url}"
-    else
-        # Get list of available RPMs from the source
+        log_info "Using AGENT_RPM_URL (pinned): ${agent_rpm_url}"
+        if [ -z "$selinux_rpm_url" ] && [ -f "${WORK_DIR}/.brew_rpms.list" ]; then
+            selinux_rpm_url=$(grep 'flightctl-selinux' "${WORK_DIR}/.brew_rpms.list" | grep '\.rpm$' | head -1)
+            if [ -n "$selinux_rpm_url" ]; then
+                selinux_rpm=$(basename "${selinux_rpm_url}")
+                log_info "Paired flightctl-selinux from Brew task list: ${selinux_rpm}"
+            fi
+        fi
+    fi
+
+    # 1) Brew task: same build as services — use full URLs from parsed task list.
+    if [ -z "$agent_rpm_url" ] && [ -f "${WORK_DIR}/.brew_rpms.list" ]; then
+        agent_rpm_url=$(grep 'flightctl-agent' "${WORK_DIR}/.brew_rpms.list" | grep -E 'x86_64\.rpm$' | head -1)
+        if [ -n "$agent_rpm_url" ]; then
+            agent_rpm=$(basename "${agent_rpm_url}")
+            if [ -z "$selinux_rpm_url" ]; then
+                selinux_rpm_url=$(grep 'flightctl-selinux' "${WORK_DIR}/.brew_rpms.list" | grep '\.rpm$' | head -1)
+                if [ -n "$selinux_rpm_url" ]; then
+                    selinux_rpm=$(basename "${selinux_rpm_url}")
+                fi
+            fi
+            log_info "flightctl-agent from Brew task RPM list: ${agent_rpm}"
+        fi
+    fi
+
+    # 2) Copr / directory URL: discover agent next to services.
+    if [ -z "$agent_rpm_url" ]; then
         log_info "Looking for agent RPMs in ${RPM_BASE_URL}..."
         rpm_list=$(curl -sL "${RPM_BASE_URL}" | grep -oE "href=['\"][^'\"]*\.rpm['\"]" | sed "s/href=['\"]//;s/['\"]$//" | sort -u)
-
-        # Find agent RPM
         agent_rpm=$(echo "$rpm_list" | grep -E "flightctl-agent.*x86_64\.rpm" | head -1)
-        if [ -z "$agent_rpm" ]; then
-            log_error "Could not find flightctl-agent RPM in ${RPM_BASE_URL}"
+        if [ -n "$agent_rpm" ]; then
+            agent_rpm_url="${RPM_BASE_URL}${agent_rpm}"
+            selinux_rpm=$(echo "$rpm_list" | grep -E "flightctl-selinux.*\.rpm" | head -1)
+            if [ -n "$selinux_rpm" ]; then
+                selinux_rpm_url="${RPM_BASE_URL}${selinux_rpm}"
+            fi
+        fi
+    fi
+
+    # 2b) Pinned or direct agent URL: pair flightctl-selinux from the same directory (required by agent RPM).
+    if [ -n "$agent_rpm_url" ] && [ -z "$selinux_rpm_url" ] && [ -z "${AGENT_SELINUX_RPM_URL:-}" ]; then
+        local agent_dir="${agent_rpm_url%/*}"
+        if [ -n "$agent_dir" ] && [ "$agent_dir" != "$agent_rpm_url" ]; then
+            log_info "Looking for flightctl-selinux next to agent RPM (${agent_dir}/)..."
+            rpm_list=$(curl -sL "${agent_dir}/" 2>/dev/null | grep -oE "href=['\"][^'\"]*\.rpm['\"]" | sed "s/href=['\"]//;s/['\"]$//" | sort -u)
+            selinux_rpm=$(echo "$rpm_list" | grep -E "flightctl-selinux.*\.rpm" | head -1)
+            if [ -n "$selinux_rpm" ]; then
+                selinux_rpm_url="${agent_dir}/${selinux_rpm}"
+                log_info "Paired flightctl-selinux: ${selinux_rpm}"
+            fi
+        fi
+    fi
+
+    if [ -z "$selinux_rpm" ]; then
+        log_warning "Could not find flightctl-selinux RPM in source — agent install may fail (agent requires flightctl-selinux). Set AGENT_SELINUX_RPM_URL in verification.conf if needed."
+    fi
+
+    # 3) Last resort: explicit override when source has no agent RPM.
+    if [ -z "$agent_rpm_url" ]; then
+        if [ -n "${AGENT_RPM_URL:-}" ]; then
+            agent_rpm_url="${AGENT_RPM_URL}"
+            agent_rpm=$(basename "${agent_rpm_url}")
+            if [ -z "${AGENT_SELINUX_RPM_URL:-}" ]; then
+                selinux_rpm=""
+                selinux_rpm_url=""
+            fi
+            log_info "Using AGENT_RPM_URL (fallback): ${agent_rpm_url}"
+        else
+            log_error "Could not find flightctl-agent RPM (Brew list, ${RPM_BASE_URL}, or AGENT_RPM_URL)"
             log_error "Set AGENT_RPM_URL in verification.conf to a direct agent RPM URL and retry."
             return 1
         fi
-
-        # Find selinux RPM (optional)
-        selinux_rpm=$(echo "$rpm_list" | grep -E "flightctl-selinux.*\.rpm" | head -1)
-        if [ -z "$selinux_rpm" ]; then
-            log_warning "Could not find flightctl-selinux RPM - will try to install without it"
-        fi
-
-        # Download and copy agent RPM
-        agent_rpm_url="${RPM_BASE_URL}${agent_rpm}"
     fi
 
     local local_agent_rpm="${WORK_DIR}/${agent_rpm}"
@@ -3189,8 +3370,7 @@ install_agent_on_vm() {
     agent_scp "${local_agent_rpm}" "${AGENT_VM_USER}@${AGENT_VM_IP}:/tmp/"
     
     # Download and copy selinux RPM if found
-    if [ -n "$selinux_rpm" ]; then
-        local selinux_rpm_url="${RPM_BASE_URL}${selinux_rpm}"
+    if [ -n "$selinux_rpm" ] && [ -n "$selinux_rpm_url" ]; then
         local local_selinux_rpm="${WORK_DIR}/${selinux_rpm}"
         
         if [ ! -f "${local_selinux_rpm}" ]; then
@@ -3233,6 +3413,31 @@ install_agent_on_vm() {
     fi
     
     log_success "flightctl-agent installed on agent VM"
+
+    # Verify SELinux context on agent VM
+    log_info "Verifying SELinux context for flightctl-agent on agent VM..."
+    local agent_selinux_status=$(agent_ssh_exec "getenforce 2>/dev/null" || echo "Unknown")
+    log_info "Agent VM SELinux status: ${agent_selinux_status}"
+
+    if [ "$agent_selinux_status" != "Disabled" ]; then
+        local agent_selinux_context=$(agent_ssh_exec "ls -Z /usr/bin/flightctl-agent 2>/dev/null | awk '{print \$1}'" || echo "")
+
+        if [ -n "$agent_selinux_context" ]; then
+            log_info "Agent SELinux context: ${agent_selinux_context}"
+
+            if echo "$agent_selinux_context" | grep -q "flightctl_agent_exec_t"; then
+                log_success "Agent binary has correct SELinux type: flightctl_agent_exec_t"
+            else
+                log_warning "Agent binary SELinux context may be incorrect: ${agent_selinux_context}"
+                log_info "Expected type: flightctl_agent_exec_t"
+            fi
+        else
+            log_warning "Could not retrieve agent SELinux context"
+        fi
+    else
+        log_info "SELinux is disabled on agent VM, skipping context verification"
+    fi
+
     return 0
 }
 
@@ -3287,6 +3492,165 @@ start_agent_service() {
         agent_ssh_exec_sudo "journalctl -u flightctl-agent --no-pager -n 50" || true
         return 1
     fi
+}
+
+# Resolved fleet name for verification onboarding (DEVICE_FLEET or default).
+verification_fleet_name() {
+    if [ -n "${DEVICE_FLEET:-}" ]; then
+        echo "${DEVICE_FLEET}"
+    else
+        echo "verification-fleet"
+    fi
+}
+
+# Build matchLabels YAML lines (6-space indent) from DEVICE_LABELS "k=v,k2=v2".
+fleet_match_labels_yaml_from_device_labels() {
+    local labels="${DEVICE_LABELS:-}"
+    if [ -z "$labels" ]; then
+        return 1
+    fi
+    local pair k v
+    IFS=',' read -ra PAIRS <<< "$labels"
+    for pair in "${PAIRS[@]}"; do
+        pair="${pair#"${pair%%[![:space:]]*}"}"
+        pair="${pair%"${pair##*[![:space:]]}"}"
+        [ -z "$pair" ] && continue
+        k="${pair%%=*}"
+        v="${pair#*=}"
+        echo "      ${k}: ${v}"
+    done
+}
+
+# Create a Fleet whose selector matches DEVICE_LABELS; enrolled devices approved with the same labels join this fleet.
+create_verification_fleet_for_onboarding() {
+    local fleet_name
+    fleet_name=$(verification_fleet_name)
+    local match_block
+    if ! match_block=$(fleet_match_labels_yaml_from_device_labels); then
+        log_warning "DEVICE_LABELS is empty — skipping fleet creation (set DEVICE_LABELS to use fleet onboarding)"
+        return 0
+    fi
+    if [ -z "$(echo "$match_block" | tr -d '[:space:]')" ]; then
+        log_warning "DEVICE_LABELS produced no match labels — skipping fleet creation"
+        return 0
+    fi
+
+    log_info ""
+    log_info "Creating verification fleet '${fleet_name}' (selector matches DEVICE_LABELS; template adds inline file config only, no os.image)..."
+    local fleet_yaml="apiVersion: v1beta1
+kind: Fleet
+metadata:
+  name: ${fleet_name}
+spec:
+  selector:
+    matchLabels:
+${match_block}
+  template:
+    spec:
+      config:
+        - name: verification-inline
+          inline:
+            - path: /etc/flightctl-verification-marker
+              content: 'flightctl-verification-onboarding-fleet'
+              mode: 0644"
+
+    local create_result
+    create_result=$(ssh_exec "echo '${fleet_yaml}' | flightctl apply -f - 2>&1" || echo "apply failed")
+
+    if echo "$create_result" | grep -qiE "created|configured|applied|unchanged"; then
+        log_success "Fleet '${fleet_name}' applied (visible in UI: Fleets / ${fleet_name})"
+        printf '%s\n' "${fleet_name}" > "${WORK_DIR}/.verification_fleet_name" 2>/dev/null || true
+    else
+        log_warning "Fleet apply returned: ${create_result}"
+    fi
+}
+
+# Poll until device summary status updates (e.g. leaves Unknown) after fleet template applies.
+wait_for_device_status_after_fleet_assignment() {
+    local device_name="$1"
+    local max_attempts="${DEVICE_FLEET_STATUS_MAX_ATTEMPTS:-36}"
+    local wait_interval="${DEVICE_FLEET_STATUS_WAIT_INTERVAL:-5}"
+
+    log_info "Waiting for device '${device_name}' status to update after fleet assignment (max ${max_attempts} attempts, ${wait_interval}s apart)..."
+
+    local attempt=1
+    local device_json summary summary_lc last_seen
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        device_json=$(ssh_exec "flightctl get device '${device_name}' -o json 2>/dev/null" || echo "{}")
+        summary=$(echo "$device_json" | jq -r '.status.summary.status // ""' 2>/dev/null || echo "")
+        last_seen=$(echo "$device_json" | jq -r '.status.lastSeen // ""' 2>/dev/null || echo "")
+
+        if [ -n "$summary" ] && [ "$summary" != "null" ]; then
+            summary_lc=$(echo "$summary" | tr '[:upper:]' '[:lower:]')
+            if [ "$summary_lc" != "unknown" ]; then
+                log_success "Device status updated after fleet: summary.status=${summary} (lastSeen=${last_seen:-n/a})"
+                return 0
+            fi
+        fi
+
+        log_info "Device summary status still '${summary:-empty}', lastSeen='${last_seen:-empty}' (${attempt}/${max_attempts})..."
+        sleep "$wait_interval"
+        attempt=$((attempt + 1))
+    done
+
+    log_warning "Device summary status did not leave Unknown within $((max_attempts * wait_interval))s — check UI or agent (device: ${device_name})"
+    return 0
+}
+
+# After enrollment, confirm device carries DEVICE_LABELS and the fleet resource exists (label-based membership).
+verify_device_in_verification_fleet() {
+    local device_name="$1"
+    local fleet_name
+    fleet_name=$(verification_fleet_name)
+
+    if [ -z "${DEVICE_LABELS:-}" ]; then
+        log_info "DEVICE_LABELS unset — skipping fleet membership check"
+        return 0
+    fi
+
+    log_info "Verifying device '${device_name}' labels match fleet '${fleet_name}' selector..."
+
+    local device_json
+    device_json=$(ssh_exec "flightctl get device '${device_name}' -o json 2>/dev/null" || echo "{}")
+
+    local failed=false
+    local pair k v dv
+    IFS=',' read -ra PAIRS <<< "${DEVICE_LABELS}"
+    for pair in "${PAIRS[@]}"; do
+        pair="${pair#"${pair%%[![:space:]]*}"}"
+        pair="${pair%"${pair##*[![:space:]]}"}"
+        [ -z "$pair" ] && continue
+        k="${pair%%=*}"
+        v="${pair#*=}"
+        dv=$(echo "$device_json" | jq -r --arg k "$k" '.metadata.labels[$k] // empty' 2>/dev/null || echo "")
+        if [ "$dv" = "$v" ]; then
+            log_success "Device label ${k}=${v} (matches fleet selector)"
+        else
+            log_warning "Label ${k}: expected '${v}', device has '${dv}'"
+            failed=true
+        fi
+    done
+
+    local fleet_json
+    fleet_json=$(ssh_exec "flightctl get fleet '${fleet_name}' -o json 2>/dev/null" || echo "{}")
+    if echo "$fleet_json" | jq -e '.kind == "Fleet"' >/dev/null 2>&1; then
+        log_success "Fleet '${fleet_name}' is present on the server"
+    else
+        log_warning "Could not read fleet '${fleet_name}'"
+        failed=true
+    fi
+
+    if [ "$failed" = true ]; then
+        log_warning "Fleet label check had issues — inspect: flightctl get device ${device_name} -o yaml && flightctl get fleet ${fleet_name} -o yaml"
+        return 1
+    fi
+
+    log_success "Device '${device_name}' is in fleet '${fleet_name}' (label selector match)"
+
+    wait_for_device_status_after_fleet_assignment "$device_name"
+
+    return 0
 }
 
 # Wait for enrollment request to appear
@@ -3453,6 +3817,9 @@ test_device_onboarding() {
     # Step 2: Generate enrollment config
     generate_enrollment_config
     
+    # Step 2b: Fleet with selector = DEVICE_LABELS (device receives these labels at approval → joins fleet)
+    create_verification_fleet_for_onboarding
+    
     # Step 2.5: Prepare e2e environment (if using flightctl repo)
     if [ "${USE_MAKE_AGENT_VM:-false}" = "true" ] && [ -n "${FLIGHTCTL_REPO_PATH:-}" ]; then
         prepare_e2e_environment
@@ -3506,12 +3873,18 @@ test_device_onboarding() {
     # Step 9: Verify device communication
     verify_device_communication "$device_name"
     
+    # Step 10: Confirm fleet membership (labels applied at approval must match fleet selector)
+    verify_device_in_verification_fleet "$device_name" || true
+    
     echo ""
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_success "Device Onboarding Test Complete!"
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "  Agent VM: ${AGENT_VM_NAME} (${AGENT_VM_IP})"
     log_info "  Device: ${device_name}"
+    if [ -n "${DEVICE_LABELS:-}" ]; then
+        log_info "  Fleet:  $(verification_fleet_name) (selector matches DEVICE_LABELS)"
+    fi
     log_info ""
     log_info "  To access agent VM:"
     log_info "    ssh ${AGENT_VM_USER}@${AGENT_VM_IP}"
@@ -3527,6 +3900,65 @@ test_device_onboarding() {
 ################################################################################
 # Main Execution
 ################################################################################
+
+# Partial run: HTTPS UI probe + device onboarding path only.
+# Does not run FULL_CLEANUP, RPM install, start_services, or auth/CLI/API tests.
+# Optional VERIFY_WORK_DIR selects work dir; otherwise newest SCRIPT_DIR/flightctl_verification_* is used.
+run_agent_ui_only_mode() {
+    echo "=================================="
+    echo "FlightCtl — UI + device onboarding only"
+    echo "=================================="
+    echo ""
+
+    FULL_CLEANUP="false"
+
+    log_info "VM Name: ${VM_NAME}"
+
+    if [ -n "${VERIFY_WORK_DIR:-}" ]; then
+        WORK_DIR="${VERIFY_WORK_DIR}"
+    else
+        local latest
+        latest=$(ls -1dt "${SCRIPT_DIR}"/flightctl_verification_* 2>/dev/null | head -1) || true
+        if [ -n "${latest}" ] && [ -d "${latest}" ]; then
+            WORK_DIR="${latest}"
+        else
+            WORK_DIR="$(pwd)/flightctl_verification_$(date +%Y%m%d_%H%M%S)"
+            log_warning "No prior ${SCRIPT_DIR}/flightctl_verification_* directory; using new WORK_DIR=${WORK_DIR}"
+        fi
+    fi
+    mkdir -p "${WORK_DIR}"
+    REPORT_FILE="${WORK_DIR}/verification_report.md"
+    log_info "Work Directory: ${WORK_DIR}"
+    echo ""
+
+    check_prerequisites
+    determine_rpm_url
+
+    log_info "Using RPM URL: ${RPM_BASE_URL}"
+    echo ""
+
+    get_vm_ip
+    setup_passwordless_sudo || true
+    ensure_vm_hostname || true
+
+    log_info "Skipping cleanup, RPM install, services, auth, CLI, API, and OIDC test phases."
+    echo ""
+
+    if ! test_ui; then
+        log_error "UI test failed"
+        return 1
+    fi
+
+    ENABLE_DEVICE_ONBOARDING="true"
+    export ENABLE_DEVICE_ONBOARDING
+    if ! test_device_onboarding; then
+        log_error "Device onboarding failed"
+        return 1
+    fi
+
+    log_success "VERIFY_RUN_MODE=agent_ui_only completed."
+    return 0
+}
 
 main() {
     echo "=================================="
@@ -3560,6 +3992,7 @@ main() {
     stop_old_services
     remove_old_packages
     install_rpms
+    verify_selinux_context
     check_container_images
     start_services
     check_service_status
@@ -3640,7 +4073,12 @@ main() {
     echo ""
 }
 
-# Run main function
+# Run main (or partial agent+UI mode)
+if [ "${VERIFY_RUN_MODE:-}" = "agent_ui_only" ]; then
+    run_agent_ui_only_mode
+    exit $?
+fi
+
 main "$@"
 
 
