@@ -28,14 +28,19 @@
 #   --with-agent        also dnf-install flightctl-agent on THIS host
 #   --build-agent       build a device bootc image (agent + enroll config)
 #   --agent-base <ref>  base bootc image (default: registry.redhat.io/rhel10/rhel-bootc:10.1)
-#   --agent-image <t>   image tag to build
+#   --agent-image <t>   image tag to build (default: flightctl-agent-rhelN:<ver>
+#                       derived from --agent-base's RHEL major, N=9 or 10)
 #   --agent-out <dir>   output dir for bootc-image-builder (qcow2)
 #   --agent-export <t>  qcow2 | iso | vmdk (default: qcow2)
 #   --boot-device       boot the exported qcow2 as a nested libvirt VM and add a
 #                       libvirt DNS host entry for --base-domain (needs --build-agent)
 #   --force             re-do steps even if already satisfied (reinstall/restart)
+#   --no-clean          keep any existing deployment (default: clean + reinstall)
 #   --cleanup           full uninstall of RHEM (destructive), then exit
 #   --list              only show available versions, then exit
+#
+# By default every run cleans any existing RHEM deployment first, then reinstalls
+# from scratch. Use --no-clean to run idempotently on top of an existing install.
 #
 # Env: ADMIN_PASSWORD='...'  set the admin password non-interactively
 #
@@ -56,6 +61,7 @@ INSTALL_AGENT=0                # install flightctl-agent RPM on THIS host too (t
 LIST_ONLY=0                    # only show available versions, then exit
 FORCE=0                        # re-do steps even if already satisfied (reinstall/restart)
 CLEANUP=0                      # full uninstall of RHEM, then exit
+CLEAN_FIRST=1                  # clean any existing RHEM before installing (default on); --no-clean to disable
 
 # --- device bootc image build + enrollment (--build-agent) ---
 # There is NO prebuilt rhem/flightctl-device image. The documented released
@@ -65,7 +71,7 @@ CLEANUP=0                      # full uninstall of RHEM, then exit
 BUILD_AGENT=0                  # build a device bootc image with the agent + enrollment config
 BOOT_DEVICE=0                  # boot the exported qcow2 as a nested libvirt VM + add DNS host entry
 AGENT_BASE="registry.redhat.io/rhel10/rhel-bootc:10.1"   # RHEL 10 bootc base (image mode)
-AGENT_IMAGE="localhost/flightctl-agent-rhel10:${FCVER}"  # image tag to build
+AGENT_IMAGE=""                # image tag to build; default derived from AGENT_BASE's RHEL major
 AGENT_OUT="./agent-image"     # output dir for bootc-image-builder (qcow2)
 AGENT_EXPORT="qcow2"          # qcow2 | iso | vmdk
 ENROLL_EXPIRE="365d"          # enrollment cert lifetime
@@ -95,6 +101,7 @@ while [[ $# -gt 0 ]]; do
         --agent-export) AGENT_EXPORT="$2"; shift 2 ;;
         --force)       FORCE=1; shift ;;
         --cleanup)     CLEANUP=1; shift ;;
+        --no-clean)    CLEAN_FIRST=0; shift ;;
         --list)        LIST_ONLY=1; shift ;;
         -h|--help)     usage 0 ;;
         *) echo "Unknown arg: $1" >&2; usage 1 ;;
@@ -248,9 +255,12 @@ boot_device_vm() {
         || echo "WARN: could not add DNS host entry (add it manually)." >&2
 
     log "Booting device VM '${vm_name}' from ${disk} on network ${LIBVIRT_NET}"
+    # Tear down any prior device VM of the same name so we boot a fresh one.
     if sudo virsh dominfo "${vm_name}" >/dev/null 2>&1; then
-        echo "VM '${vm_name}' already exists; leaving it in place (virsh destroy/undefine to reset)."
-        return 0
+        echo "Removing existing VM '${vm_name}' for a fresh boot."
+        sudo virsh destroy "${vm_name}" >/dev/null 2>&1 || true
+        sudo virsh undefine "${vm_name}" --nvram >/dev/null 2>&1 \
+            || sudo virsh undefine "${vm_name}" >/dev/null 2>&1 || true
     fi
     sudo virt-install \
         --name "${vm_name}" \
@@ -318,6 +328,20 @@ if ! [[ "$BASE_DOMAIN" =~ ^([a-z0-9]([-a-z0-9]*[a-z0-9])?\.)*[a-z]([-a-z0-9]*[a-
     echo "ERROR: --base-domain '$BASE_DOMAIN' is not a valid hostname/FQDN." >&2
     echo "       Expected pattern like 'host.example.com' (lowercase)." >&2
     exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 1b. Clean any existing RHEM first (default), then reinstall from scratch
+# ---------------------------------------------------------------------------
+# Every run starts from a clean slate: fully uninstall any prior deployment,
+# then reinstall. Pass --no-clean to keep an existing deployment and run the
+# idempotent path instead. Cleaning implies a full (re)install, so force the
+# install/restart steps below.
+if [[ "$CLEAN_FIRST" -eq 1 ]]; then
+    cleanup_rhem
+    FORCE=1
+else
+    echo "--no-clean: keeping any existing deployment (idempotent run)."
 fi
 
 # ---------------------------------------------------------------------------
@@ -432,6 +456,18 @@ fi
 # config, export a qcow2, then approve the enrollment request on the server.
 if [[ "$BUILD_AGENT" -eq 1 ]]; then
     log "Building bootc agent image with embedded enrollment config"
+
+    # Derive the local image tag from the agent base's RHEL major unless the
+    # caller overrode it with --agent-image (e.g. flightctl-agent-rhel9:1.2.1
+    # for a RHEL 9 base, flightctl-agent-rhel10:1.2.1 for RHEL 10).
+    if [[ -z "$AGENT_IMAGE" ]]; then
+        rhel_major="rhel10"
+        case "$AGENT_BASE" in
+            *rhel9*) rhel_major="rhel9" ;;
+        esac
+        AGENT_IMAGE="localhost/flightctl-agent-${rhel_major}:${FCVER}"
+    fi
+    echo "Image tag: ${AGENT_IMAGE}"
 
     # Tooling check (docs: podman >=5.0, skopeo >=1.14, bootc-image-builder)
     command -v podman >/dev/null || { echo "ERROR: podman is required" >&2; exit 1; }
