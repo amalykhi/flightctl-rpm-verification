@@ -34,6 +34,10 @@
 #   --agent-export <t>  qcow2 | iso | vmdk (default: qcow2)
 #   --boot-device       boot the exported qcow2 as a nested libvirt VM and add a
 #                       libvirt DNS host entry for --base-domain (needs --build-agent)
+#   --server-image <r:t> override server container images as <registry>:<tag>,
+#                       e.g. registry.stage.redhat.io:1.3.0-rc4 to test a stage RC.
+#                       Rewrites every flightctl-*.container Image= before start.
+#                       Default: GA tags shipped by the RPM (registry.redhat.io).
 #   --force             re-do steps even if already satisfied (reinstall/restart)
 #   --no-clean          keep any existing deployment (default: clean + reinstall)
 #   --cleanup           full uninstall of RHEM (destructive), then exit
@@ -62,6 +66,9 @@ LIST_ONLY=0                    # only show available versions, then exit
 FORCE=0                        # re-do steps even if already satisfied (reinstall/restart)
 CLEANUP=0                      # full uninstall of RHEM, then exit
 CLEAN_FIRST=1                  # clean any existing RHEM before installing (default on); --no-clean to disable
+SERVER_IMAGE=""                # override server container images: "<registry>:<tag>", e.g.
+                               # registry.stage.redhat.io:1.3.0-rc4 to test a stage RC. Empty
+                               # keeps the GA registry.redhat.io/rhem/...:<ver> tags from the RPM.
 
 # --- device bootc image build + enrollment (--build-agent) ---
 # There is NO prebuilt rhem/flightctl-device image. The documented released
@@ -102,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         --force)       FORCE=1; shift ;;
         --cleanup)     CLEANUP=1; shift ;;
         --no-clean)    CLEAN_FIRST=0; shift ;;
+        --server-image) SERVER_IMAGE="$2"; shift 2 ;;
         --list)        LIST_ONLY=1; shift ;;
         -h|--help)     usage 0 ;;
         *) echo "Unknown arg: $1" >&2; usage 1 ;;
@@ -392,6 +400,37 @@ sudo grep -rhn "registry.redhat.io/rhem" \
     /etc/containers/systemd/ /etc/flightctl/ 2>/dev/null | sort -u || true
 echo "(Verify the tags above match ${FCVER%%-*}; edit before starting if not.)"
 
+# Optionally repoint the server container images at a different registry/tag
+# (e.g. a stage RC that only exists as images, not RPMs). The RPM bakes the GA
+# tag registry.redhat.io/rhem/flightctl-<svc>-rhelN:<ver> into each quadlet's
+# Image= line; rewrite them in place before the target starts.
+if [[ -n "$SERVER_IMAGE" ]]; then
+    si_registry="${SERVER_IMAGE%:*}"
+    si_tag="${SERVER_IMAGE##*:}"
+    if [[ -z "$si_registry" || -z "$si_tag" || "$si_registry" == "$SERVER_IMAGE" ]]; then
+        echo "ERROR: --server-image must be <registry>:<tag> (got '$SERVER_IMAGE')." >&2
+        exit 1
+    fi
+    log "Repointing server images to ${si_registry}/rhem/...:${si_tag}"
+    mapfile -t quadlets < <(
+        sudo find /usr/share/containers/systemd /etc/containers/systemd \
+            -maxdepth 1 -name 'flightctl-*.container' 2>/dev/null)
+    if [[ ${#quadlets[@]} -eq 0 ]]; then
+        echo "ERROR: no flightctl-*.container quadlets found to rewrite." >&2
+        exit 1
+    fi
+    for q in "${quadlets[@]}"; do
+        # Rewrite only the rhem service images; leave 3rd-party images
+        # (postgres, redis, nginx, alertmanager) on their original registry/tag.
+        sudo sed -i -E \
+            "s#^(Image=)[^ ]*/rhem/(flightctl-[a-z0-9-]+):[^ ]+#\1${si_registry}/rhem/\2:${si_tag}#" \
+            "$q"
+    done
+    sudo systemctl daemon-reload
+    echo "Rewritten Image= lines:"
+    sudo grep -h '^Image=.*/rhem/flightctl-' "${quadlets[@]}" | sort -u
+fi
+
 # ---------------------------------------------------------------------------
 # 5. Start & enable the target
 # ---------------------------------------------------------------------------
@@ -619,11 +658,15 @@ CF
 
     # (e) Export a disk image (qcow2/iso/vmdk) with bootc-image-builder.
     #     Use a bootc-image-builder matching the base image's RHEL major so the
-    #     builder content aligns with the agent image (RHEL 9 vs 10).
-    bib_image="registry.redhat.io/rhel10/bootc-image-builder:latest"
+    #     builder content aligns with the agent image (RHEL 9 vs 10). Take the
+    #     builder from the SAME registry as the base image so a stage base
+    #     (registry.stage.redhat.io, e.g. an RC) uses the stage builder.
+    bib_registry="${base_repo%%/*}"
+    bib_major="rhel10"
     case "$base_repo" in
-        *rhel9*) bib_image="registry.redhat.io/rhel9/bootc-image-builder:latest" ;;
+        *rhel9*) bib_major="rhel9" ;;
     esac
+    bib_image="${bib_registry}/${bib_major}/bootc-image-builder:latest"
     log "Exporting ${AGENT_EXPORT} to ${AGENT_OUT} via ${bib_image}"
     mkdir -p "${AGENT_OUT}"
     sudo podman run --rm -it --privileged --pull=newer \

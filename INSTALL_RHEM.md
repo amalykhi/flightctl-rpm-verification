@@ -55,6 +55,7 @@ ADMIN_PASSWORD='<pw>' ./install-rhem.sh --base-domain rhem.example.com \
 | `--build-agent` | off | build a device bootc image (agent + enroll config) |
 | `--agent-base <ref>` | `registry.redhat.io/rhel10/rhel-bootc:10.1` | base bootc image |
 | `--agent-export <t>` | `qcow2` | `qcow2` \| `iso` \| `vmdk` |
+| `--server-image <registry>:<tag>` | *(off)* | repoint server images, e.g. `registry.stage.redhat.io:1.3.0-rc4` for an RC |
 | `--boot-device` | off | add libvirt DNS entry + boot the qcow2 as a nested VM |
 | `--force` | off | re-do steps even if already satisfied |
 | `--cleanup` | — | full uninstall of RHEM (destructive), then exit |
@@ -81,6 +82,24 @@ Env: `ADMIN_PASSWORD='...'` sets the admin password non-interactively.
    the host IP on the libvirt network, then boot the qcow2 as a nested VM.
 
 The install is idempotent — re-runs skip already-satisfied steps unless `--force`.
+
+### Testing a release candidate (RC)
+
+RCs are published as **container images on stage** (`registry.stage.redhat.io/rhem/...`),
+not as RPMs — the RPM only ever carries the GA tag baked into its quadlets. Use
+`--server-image` to repoint the server containers at a stage RC tag; the flag
+rewrites every `flightctl-*.container` `Image=` line before the target starts
+(3rd-party images like postgres/redis/nginx are left untouched):
+
+```bash
+ADMIN_PASSWORD='<pw>' ./install-rhem.sh --base-domain rhem.example.com \
+    --version 1.3.0 --repo edge-manager-1.3-for-rhel-9-x86_64-rpms \
+    --server-image registry.stage.redhat.io:1.3.0-rc4 \
+    --agent-base registry.stage.redhat.io/rhel9/rhel-bootc:9.6 --build-agent
+```
+
+Note: there is **no RC agent RPM** — the device agent is still installed from the
+subscription repo (GA), so an RC run exercises the RC **server** with a GA agent.
 
 ## Environmental fixes captured in the script
 
