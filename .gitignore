@@ -16,3 +16,13 @@ latest_test.log
 # Editor files
 *~
 .*.swp
+
+# RHEM device enrollment secrets and build artifacts (install-rhem.sh)
+config.yaml
+agent-build/
+agent-image/
+*-pw.txt
+*-admin-pw.txt
+
+# Verification conf files may contain internal Brew URLs / credentials
+verification*.conf
