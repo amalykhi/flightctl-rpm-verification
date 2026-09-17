@@ -9,7 +9,12 @@ The script is **RHEL-version-agnostic**. It is proven on:
 | Host | baseDomain | Services + CLI | Agent | Result |
 |------|------------|----------------|-------|--------|
 | RHEL 10.1 (rhel10-fips-vm) | `rhel10-fips-vm.local` | `1.2.1-1.el10` | `1.2.1` | device Online / UpToDate |
-| RHEL 9.6 (eurolinux9 VM)   | `eurolinux9.lab`       | `1.2.1-1.el9`  | `1.2.1` | device Online (firewall ports opened) |
+| RHEL 9.6 (eurolinux9 VM)   | `eurolinux9.lab`       | `1.2.1-1.el9`  | `1.2.1` | device Online / UpToDate (firewall ports opened) |
+
+Endpoints (verified): web console on `https://<base-domain>/` (port 443,
+title "Red Hat Edge Manager"); API/CLI + enrollment on `:3443`; agents on
+`:7443`. The CLI login and the UI use a self-signed cert, so pass
+`--insecure-skip-tls-verify` (or trust the CA under `/etc/flightctl/pki`).
 
 Docs: <https://docs.redhat.com/en/documentation/red_hat_edge_manager>
 
@@ -66,8 +71,9 @@ Env: `ADMIN_PASSWORD='...'` sets the admin password non-interactively.
 3. `dnf install flightctl-services flightctl-cli` (pinned to `--version`).
 4. Set `baseDomain`, start `flightctl.target`, create the admin user (OIDC via
    `flightctl-pam-issuer`, password hashed with `openssl passwd -6`).
-5. **Open firewalld ports** 7443 (management/gRPC) and 3443 (UI/enrollment),
-   runtime + permanent, when firewalld is active.
+5. **Open firewalld ports** 7443 (agent/management gRPC) and 3443 (API/CLI +
+   enrollment), runtime + permanent, when firewalld is active. The web console
+   is served separately on port 443.
 6. With `--build-agent`: build a bootc image `FROM` the RHEL bootc base, install
    the version-pinned agent (other `edge-manager-*` streams disabled so a newer
    1.3 repo can't win resolution), embed the enrollment config, export a disk.

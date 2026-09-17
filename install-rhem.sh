@@ -199,7 +199,7 @@ open_firewall_ports() {
 # import and boot the exported qcow2 on that same network. Requires --build-agent
 # (so the qcow2 exists) and libvirt tooling (virsh/virt-install).
 boot_device_vm() {
-    local disk vm_name os_variant
+    local disk vm_name os_variant libvirt_disk gw
     disk="$(realpath "${AGENT_OUT}")/${AGENT_EXPORT}/disk.${AGENT_EXPORT}"
     vm_name="rhem-device-${FCVER//./-}"
 
@@ -218,6 +218,23 @@ boot_device_vm() {
         echo "WARN: expected disk ${disk} not found; skipping boot." >&2
         return 0
     fi
+
+    # Determine the gateway IP that serves DNS on the libvirt network, rather
+    # than assuming a fixed value — nested hosts vary (e.g. 192.168.122.1 vs
+    # 192.168.124.1). Fall back to the configured default if it can't be read.
+    gw="$(sudo virsh net-dumpxml "${LIBVIRT_NET}" 2>/dev/null \
+            | grep -oP "ip address='\K[0-9.]+" | head -1)"
+    [[ -n "$gw" ]] && LIBVIRT_HOST_IP="$gw"
+
+    # qemu (the qemu/libvirt user) cannot read a disk under a locked-down $HOME
+    # (0700). Copy the exported image into the libvirt images pool where qemu has
+    # access, and boot from that copy.
+    libvirt_disk="/var/lib/libvirt/images/${vm_name}.${AGENT_EXPORT}"
+    log "Copying device disk to ${libvirt_disk} (qemu-readable)"
+    sudo install -m 0644 "$disk" "$libvirt_disk"
+    sudo chown qemu:qemu "$libvirt_disk" 2>/dev/null || true
+    sudo restorecon "$libvirt_disk" 2>/dev/null || true
+    disk="$libvirt_disk"
 
     log "Adding libvirt DNS host entry: ${BASE_DOMAIN} -> ${LIBVIRT_HOST_IP} (net ${LIBVIRT_NET})"
     # Idempotent: remove any stale entry for this hostname first, then add.
@@ -432,22 +449,37 @@ if [[ "$BUILD_AGENT" -eq 1 ]]; then
     # A host still on the 10.1 image does not have this key, so any dnf install
     # of el10_2 content (including virt tooling, or agent deps) fails with
     # "GPG check FAILED / NOKEY". We import it from the newer redhat-release rpm
-    # (the legitimate source) rather than bypassing GPG. Harmless no-op on RHEL 9.
-    if ! rpm -q gpg-pubkey --qf '%{version}\n' 2>/dev/null | grep -q '^05707a62$'; then
+    # (the legitimate source) rather than bypassing GPG.
+    #
+    # This only matters for RHEL 10 agent bases — skip it entirely on RHEL 9,
+    # where the key does not exist and the import is a pure no-op. The whole
+    # block is wrapped so a failure here (e.g. a subscription hiccup) only WARNs
+    # and never aborts the build under `set -e`.
+    if [[ "$AGENT_BASE" == *rhel10* ]] \
+       && ! rpm -q gpg-pubkey --qf '%{version}\n' 2>/dev/null | grep -q '^05707a62$'; then
         echo "RHEL 10.2 PQC release key (05707a62) missing; importing from redhat-release..."
-        keytmp="$(mktemp -d)"
-        rr="$(sudo dnf download --downloaddir="$keytmp" redhat-release 2>/dev/null; ls "$keytmp"/redhat-release-*.rpm 2>/dev/null | sort -V | tail -1)"
-        if [[ -n "$rr" ]]; then
-            ( cd "$keytmp" && rpm2cpio "$rr" | cpio -idm ./etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release >/dev/null 2>&1 )
-            sudo rpm --import "$keytmp/etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release" 2>/dev/null \
-                && echo "OK: imported release key from $(basename "$rr")" \
-                || echo "WARN: could not import PQC key; el10_2 installs may fail GPG check" >&2
-        else
-            echo "WARN: could not download redhat-release to obtain PQC key" >&2
-        fi
-        rm -rf "$keytmp"
+        import_pqc_key() {
+            local keytmp rr
+            keytmp="$(mktemp -d)"
+            # Send dnf's "Updating Subscription Management..." chatter to stderr so
+            # only the rpm path is captured; then pick the newest downloaded rpm.
+            sudo dnf download --downloaddir="$keytmp" redhat-release >&2 2>/dev/null || true
+            rr="$(ls "$keytmp"/redhat-release-*.rpm 2>/dev/null | sort -V | tail -1)"
+            if [[ -n "$rr" && -f "$rr" ]]; then
+                ( cd "$keytmp" && rpm2cpio "$rr" | cpio -idm ./etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release >/dev/null 2>&1 )
+                if sudo rpm --import "$keytmp/etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release" 2>/dev/null; then
+                    echo "OK: imported release key from $(basename "$rr")"
+                else
+                    echo "WARN: could not import PQC key; el10_2 installs may fail GPG check" >&2
+                fi
+            else
+                echo "WARN: could not download redhat-release to obtain PQC key" >&2
+            fi
+            rm -rf "$keytmp"
+        }
+        import_pqc_key || echo "WARN: PQC key import step failed (continuing)" >&2
     else
-        echo "OK: RHEL 10.2 PQC release key (05707a62) already imported"
+        echo "OK: RHEL 10.2 PQC release key not required for this base (${AGENT_BASE##*/})"
     fi
 
     # Preflight: confirm the agent base image tag actually exists before building.
@@ -484,9 +516,16 @@ if [[ "$BUILD_AGENT" -eq 1 ]]; then
     workdir="$(mktemp -d)"
     echo "Build workdir: $workdir"
 
-    # (a) Log in the CLI so we can request an enrollment cert
+    # (a) Log in the CLI so we can request an enrollment cert.
+    #     Use ADMIN_PASSWORD when set so the build runs non-interactively (the
+    #     CLI requires --username and --password together; a lone --username
+    #     errors). The server presents a self-signed cert, so skip TLS verify.
     echo "Logging in flightctl CLI (needed to request enrollment config)..."
-    flightctl login "https://${BASE_DOMAIN}:3443" --username "${ADMIN_USER}"
+    login_args=(--username "${ADMIN_USER}" --insecure-skip-tls-verify)
+    if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
+        login_args+=(--password "${ADMIN_PASSWORD}")
+    fi
+    flightctl login "https://${BASE_DOMAIN}:3443" "${login_args[@]}"
 
     # (b) Request an agent config with embedded enrollment certificate.
     #     SECRET: contains cert material — never commit config.yaml.
@@ -588,7 +627,8 @@ fi
 # ---------------------------------------------------------------------------
 log "Done"
 cat <<EOF
-UI:    https://${BASE_DOMAIN}:3443   (self-signed cert under /etc/flightctl/pki)
-Login: flightctl login https://${BASE_DOMAIN}:3443 --username ${ADMIN_USER} --password <password>
+UI:    https://${BASE_DOMAIN}/          (web console, port 443; self-signed cert)
+API:   https://${BASE_DOMAIN}:3443      (CLI/enrollment endpoint; 7443 for agents)
+Login: flightctl login https://${BASE_DOMAIN}:3443 --username ${ADMIN_USER} --password <password> --insecure-skip-tls-verify
 Logs:  journalctl -u flightctl-<service> -b --no-pager
 EOF
