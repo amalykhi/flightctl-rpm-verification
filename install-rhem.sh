@@ -210,11 +210,25 @@ boot_device_vm() {
     disk="$(realpath "${AGENT_OUT}")/${AGENT_EXPORT}/disk.${AGENT_EXPORT}"
     vm_name="rhem-device-${FCVER//./-}"
 
-    # Pick the libvirt os-variant from the agent base image's RHEL major.
-    os_variant="rhel10.2"
+    # Pick the libvirt os-variant from the agent base image's RHEL major. Use a
+    # generic per-major variant that every osinfo database knows (specific
+    # minors like rhel10.2 may be missing on older libvirt and abort
+    # virt-install). os-variant only tunes hardware defaults, not correctness
+    # for an --import boot. If even the generic name is unknown, fall back to
+    # the newest matching variant osinfo does have, else "detect".
+    os_variant="rhel10.0"
     case "${AGENT_BASE}" in
-        *rhel9*) os_variant="rhel9.6" ;;
+        *rhel9*) os_variant="rhel9.0" ;;
     esac
+    if command -v osinfo-query >/dev/null 2>&1; then
+        if ! osinfo-query os 2>/dev/null | grep -qw "$os_variant"; then
+            local os_major="rhel10"
+            [[ "$os_variant" == rhel9* ]] && os_major="rhel9"
+            os_variant="$(osinfo-query os 2>/dev/null | awk -v m="$os_major" '$1 ~ "^"m"\\." {print $1}' | sort -V | tail -1)"
+            [[ -z "$os_variant" ]] && os_variant="detect=on"
+        fi
+    fi
+    echo "Using --os-variant ${os_variant}"
 
     if ! command -v virsh >/dev/null 2>&1 || ! command -v virt-install >/dev/null 2>&1; then
         echo "WARN: virsh/virt-install not found; skipping --boot-device." >&2
